@@ -1633,13 +1633,16 @@ def gls_ramp_fit(input_model, buffsize, save_opt, readnoise_model, gain_model, m
     nreads, npix, imshape, cubeshape, n_int, instrume, frame_time, ngroups, \
         group_time = utils.get_dataset_info(input_model)
 
+    # Get exposure information
     (group_time, frames_per_group, saturated_flag, jump_flag) = \
         utils.get_more_info(input_model)
+
     # Get readnoise array for calculation of variance of noiseless ramps, and
     #   gain array in case optimal weighting is to be done
     #   KDG - not sure what this means and no optimal weigting in GLS
-    readnoise_2d, gain_2d = utils.get_ref_subs(input_model, readnoise_model,
-                                               gain_model, frames_per_group)
+    readnoise_2d, gain_2d = utils.get_ref_subs(
+        input_model, readnoise_model, gain_model, frames_per_group)
+
     # Flag any bad pixels in the gain
     pixeldq = utils.reset_bad_gain(input_model.pixeldq, gain_2d)
     log.info("number of processes being used is %d" % number_slices)
@@ -1831,6 +1834,7 @@ def gls_ramp_fit(input_model, buffsize, save_opt, readnoise_model, gain_model, m
     return new_model, int_model, gls_opt_model
 
 
+# BEGIN
 def gls_fit_all_integrations(
         frame_time, gain_2d, gdq_cube, group_time, jump_flag, max_num_cr, data_sect,
         input_var_sect, nframes_used, pixeldq, readnoise_2d, saturated_flag, save_opt):
@@ -1890,31 +1894,39 @@ def gls_fit_all_integrations(
     ampl_err_int :
         The variance of the amplitude of each cosmic ray for each pixel
     """
+    # CODE
     number_ints = data_sect.shape[0]
     number_rows = data_sect.shape[2]
     number_cols = data_sect.shape[3]
     imshape = (data_sect.shape[2], data_sect.shape[3])
+
     slope_int = np.zeros((number_ints, number_rows, number_cols), dtype=np.float32)
     slope_err_int = np.zeros((number_ints, number_rows, number_cols), dtype=np.float32)
     dq_int = np.zeros((number_ints, number_rows, number_cols), dtype=np.uint32)
+
     temp_dq = np.zeros((number_rows, number_cols), dtype=np.uint32)
     slopes = np.zeros((number_rows, number_cols), dtype=np.float32)
     sum_weight = np.zeros((number_rows, number_cols), dtype=np.float32)
+
     if save_opt:
         # Create arrays for the fitted values of zero-point intercept and
         # cosmic-ray amplitudes, and their errors.
         intercept_int = np.zeros((number_ints,) + imshape, dtype=np.float32)
         intercept_err_int = np.zeros((number_ints,) + imshape, dtype=np.float32)
+
         # The pedestal is the extrapolation of the first group back to zero
         # time, for each integration.
         pedestal_int = np.zeros((number_ints,) + imshape, dtype=np.float32)
+
         # The first group, for calculating the pedestal.  (This only needs
         # to be nrows high, but we don't have nrows yet.  xxx)
         first_group = np.zeros(imshape, dtype=np.float32)
+
         # If there are no cosmic rays, set the last axis length to 1.
         shape_ampl = (number_ints, imshape[0], imshape[1], max(1, max_num_cr))
         ampl_int = np.zeros(shape_ampl, dtype=np.float32)
         ampl_err_int = np.zeros(shape_ampl, dtype=np.float32)
+
     else:
         intercept_int = None
         intercept_err_int = None
@@ -1923,13 +1935,14 @@ def gls_fit_all_integrations(
         shape_ampl = None
         ampl_int = None
         ampl_err_int = None
+
     # loop over data integrations
     for num_int in range(number_ints):
         if save_opt:
             first_group[:, :] = 0.  # re-use this for each integration
 
-            # We'll propagate error estimates from previous steps to the
-            # current step by using the variance.
+        # We'll propagate error estimates from previous steps to the
+        # current step by using the variance.
         input_var_sect = input_var_sect ** 2
 
         # Convert the data section from DN to electrons.
@@ -1948,12 +1961,14 @@ def gls_fit_all_integrations(
         if v_mask.any():
             # Replace negative or zero variances with a large value.
             slope_var_sect[v_mask] = utils.LARGE_VARIANCE
+
             # Also set a flag in the pixel dq array.
             temp_dq[:, :][v_mask] = UNRELIABLE_SLOPE
             del v_mask
-            # If a pixel was flagged (by an earlier step) as saturated in
-            # the first group, flag the pixel as bad.
-            # Note:  save s_mask until after the call to utils.gls_pedestal.
+
+        # If a pixel was flagged (by an earlier step) as saturated in
+        # the first group, flag the pixel as bad.
+        # Note:  save s_mask until after the call to utils.gls_pedestal.
         s_mask = (gdq_cube[0] == saturated_flag)
         if s_mask.any():
             temp_dq[:, :][s_mask] = UNRELIABLE_SLOPE
@@ -1971,10 +1986,9 @@ def gls_fit_all_integrations(
             # current integration.
             intercept_int[num_int, :, :] = intercept_sect.copy()
             intercept_err_int[num_int, :, :] = np.sqrt(np.abs(intercept_var_sect))
-            pedestal_int[num_int, :, :] = utils.gls_pedestal(first_group[:, :],
-                                                             slope_int[num_int, :, :],
-                                                             s_mask,
-                                                             frame_time, nframes_used)
+            pedestal_int[num_int, :, :] = utils.gls_pedestal(
+                first_group[:, :], slope_int[num_int, :, :], s_mask, frame_time, nframes_used)
+
             ampl_int[num_int, :, :, :] = cr_sect.copy()
             ampl_err_int[num_int, :, :, :] = np.sqrt(np.abs(cr_var_sect))
 
@@ -1989,6 +2003,7 @@ def gls_fit_all_integrations(
 
     return slopes, slope_int, slope_var_sect, pixeldq_sect, dq_int, sum_weight, \
         intercept_int, intercept_err_int, pedestal_int, ampl_int, ampl_err_int
+# END
 
 
 def calc_power(snr):
