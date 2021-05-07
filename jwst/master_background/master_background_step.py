@@ -217,11 +217,11 @@ def copy_background_to_surf_bright(spectrum):
     """Copy the background column to the surf_bright column in a MultiSpecModel in-place"""
     for spec in spectrum.spec:
         spec.spec_table['SURF_BRIGHT'][:] = spec.spec_table['BACKGROUND'].copy()
-        spec.spec_table['SB_ERROR'][:] = spec.spec_table['BERROR'].copy()
+        spec.spec_table['SB_ERROR'][:] = spec.spec_table['BKGD_ERROR'].copy()
         # Zero out the background column for safety
         spec.spec_table['BACKGROUND'][:] = 0
         # Set BERROR to dummy val of 0.0, as in extract_1d currently
-        spec.spec_table['BERROR'][:] = 0.
+        spec.spec_table['BKGD_ERROR'][:] = 0.
 
 
 def split_container(container):

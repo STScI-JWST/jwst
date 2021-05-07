@@ -62,8 +62,9 @@ def create_background(wavelength, surf_bright):
 
     spec_dtype = datamodels.SpecModel().spec_table.dtype
 
-    otab = np.array(list(zip(wavelength, dummy, dummy,
-                             surf_bright, dummy, dq, dummy, dummy, npixels)),
+    otab = np.array(list(zip(wavelength, dummy, dummy, dummy, dummy, dummy,
+                             surf_bright, dummy, dummy, dummy, dummy,
+                             dq, dummy, dummy, dummy, dummy, dummy, npixels)),
                     dtype=spec_dtype)
 
     spec = datamodels.SpecModel(spec_table=otab)

@@ -101,11 +101,13 @@ def ifu_extract1d(input_model, ref_dict, source_type, subtract_background,
 
     if extract_params:
         if extract_params['ref_file_type'] == FILE_TYPE_ASDF:
-            (ra, dec, wavelength, temp_flux, background, npixels, dq, npixels_bkg,
+            (ra, dec, wavelength, temp_flux, f_var_poisson, f_var_rnoise, f_var_flat,
+             background, b_var_poisson, b_var_rnoise, b_var_flat, npixels, dq, npixels_bkg,
              radius_match, x_center, y_center) = \
                 extract_ifu(input_model, source_type, extract_params)
         else:                                   # FILE_TYPE_IMAGE
-            (ra, dec, wavelength, temp_flux, background, npixels, dq, npixels_bkg,
+            (ra, dec, wavelength, temp_flux, f_var_poisson, f_var_rnoise, f_var_flat,
+             background, b_var_poisson, b_var_rnoise, b_var_flat, npixels, dq, npixels_bkg,
              x_center, y_center) = \
                 image_extract_ifu(input_model, source_type, extract_params)
     else:
@@ -117,7 +119,13 @@ def ifu_extract1d(input_model, ref_dict, source_type, subtract_background,
 
     # Convert the sum to an average, for surface brightness.
     surf_bright = temp_flux / npixels_temp
+    sb_var_poisson = f_var_poisson / npixels_temp
+    sb_var_rnoise = f_var_rnoise / npixels_temp
+    sb_var_flat = f_var_flat / npixels_temp
     background /= npixels_bkg_temp
+    b_var_poisson /= npixels_bkg_temp
+    b_var_rnoise /= npixels_bkg_temp
+    b_var_flat /= npixels_bkg_temp
 
     del npixels_temp
     del npixels_bkg_temp
@@ -131,30 +139,58 @@ def ifu_extract1d(input_model, ref_dict, source_type, subtract_background,
     if input_units_are_megajanskys:
         # Convert flux from MJy to Jy, and convert background to MJy / sr.
         flux = temp_flux * 1.e6
+        f_var_poisson *= 1.e12  # MJy**2 --> Jy**2
+        f_var_rnoise *= 1.e12  # MJy**2 --> Jy**2
+        f_var_flat *= 1.e12  # MJy**2 --> Jy**2
         surf_bright[:] = 0.
-        background[:] /= pixel_solid_angle
+        sb_var_poisson = 0.
+        sb_var_rnoise = 0.
+        sb_var_flat = 0.
+        background[:] /= pixel_solid_angle  # MJy / sr
+        b_var_poisson /= pixel_solid_angle
+        b_var_rnoise /= pixel_solid_angle
+        b_var_flat /= pixel_solid_angle
+
     else:
         # Convert flux from MJy / steradian to Jy.
         flux = temp_flux * pixel_solid_angle * 1.e6
+        f_var_poisson *= (pixel_solid_angle ** 2 * 1.e12)  # (MJy / sr)**2 --> Jy**2
+        f_var_rnoise *= (pixel_solid_angle ** 2 * 1.e12)  # (MJy / sr)**2 --> Jy**2
+        f_var_flat *= (pixel_solid_angle ** 2 * 1.e12)  # (MJy / sr)**2 --> Jy**2
         # surf_bright and background were computed above
     del temp_flux
-    error = np.zeros_like(flux)
-    sb_error = np.zeros_like(flux)
-    berror = np.zeros_like(flux)
+    error = np.sqrt(f_var_poisson + f_var_rnoise + f_var_flat)
+    sb_error = np.sqrt(sb_var_poisson + sb_var_rnoise + sb_var_flat)
+    berror = np.sqrt(b_var_poisson + b_var_rnoise + b_var_flat)
     spec_dtype = datamodels.SpecModel().spec_table.dtype
-    otab = np.array(list(zip(wavelength,
-                             flux, error, surf_bright, sb_error,
-                             dq, background, berror, npixels)),
-                    dtype=spec_dtype)
+
+    otab = np.array(
+        list(
+            zip(wavelength, flux, error, f_var_poisson, f_var_rnoise, f_var_flat,
+                surf_bright, sb_error, sb_var_poisson, sb_var_rnoise, sb_var_flat,
+                dq, background, berror, b_var_poisson, b_var_rnoise, b_var_flat, npixels)
+        ),
+        dtype=spec_dtype
+    )
+
     spec = datamodels.SpecModel(spec_table=otab)
     spec.meta.wcs = spec_wcs.create_spectral_wcs(ra, dec, wavelength)
     spec.spec_table.columns['wavelength'].unit = 'um'
     spec.spec_table.columns['flux'].unit = "Jy"
-    spec.spec_table.columns['error'].unit = "Jy"
+    spec.spec_table.columns['flux_error'].unit = "Jy"
+    spec.spec_table.columns['flux_var_poisson'].unit = "Jy^2"
+    spec.spec_table.columns['flux_var_rnoise'].unit = "Jy^2"
+    spec.spec_table.columns['flux_var_flat'].unit = "Jy^2"
     spec.spec_table.columns['surf_bright'].unit = "MJy/sr"
     spec.spec_table.columns['sb_error'].unit = "MJy/sr"
+    spec.spec_table.columns['sb_var_poisson'].unit = "(MJy/sr)^2"
+    spec.spec_table.columns['sb_var_rnoise'].unit = "(MJy/sr)^2"
+    spec.spec_table.columns['sb_var_flat'].unit = "(MJy/sr)^2"
     spec.spec_table.columns['background'].unit = "MJy/sr"
-    spec.spec_table.columns['berror'].unit = "MJy/sr"
+    spec.spec_table.columns['bkgd_error'].unit = "MJy/sr"
+    spec.spec_table.columns['bkgd_var_poisson'].unit = "(MJy/sr)^2"
+    spec.spec_table.columns['bkgd_var_rnoise'].unit = "(MJy/sr)^2"
+    spec.spec_table.columns['bkgd_var_flat'].unit = "(MJy/sr)^2"
     spec.slit_ra = ra
     spec.slit_dec = dec
     if slitname is not None and slitname != "ANY":
@@ -292,11 +328,35 @@ def extract_ifu(input_model, source_type, extract_params):
         `surf_bright` (surface brightness) column, and multiplying by
         the solid angle of a pixel will give the flux for a point source.
 
+    f_var_poisson : ndarray, 1-D
+        The extracted poisson variance values to go along with the
+        temp_flux array.
+
+    f_var_rnoise : ndarray, 1-D
+        The extracted read noise variance values to go along with the
+        temp_flux array.
+
+    f_var_flat : ndarray, 1-D
+        The extracted flat field variance values to go along with the
+        temp_flux array.
+
     background : ndarray, 1-D
         For point source data, the background array is the count rate that was subtracted
         from the total source data values to get `temp_flux`. This background is determined
         for annulus region. For extended source data, the background array is the sigma clipped
         extracted region.
+
+    b_var_poisson : ndarray, 1-D
+        The extracted poisson variance values to go along with the
+        background array.
+
+    b_var_rnoise : ndarray, 1-D
+        The extracted read noise variance values to go along with the
+        background array.
+
+    b_var_flat : ndarray, 1-D
+        The extracted flat field variance values to go along with the
+        background array.
 
     npixels : ndarray, 1-D, float64
         For each slice, this is the number of pixels that were added
@@ -318,6 +378,9 @@ def extract_ifu(input_model, source_type, extract_params):
     """
 
     data = input_model.data
+    var_poisson = input_model.var_poisson
+    var_rnoise = input_model.var_rnoise
+    var_flat = input_model.var_flat
     weightmap = input_model.weightmap
 
     shape = data.shape
@@ -332,6 +395,12 @@ def extract_ifu(input_model, source_type, extract_params):
     background = np.zeros(shape[0], dtype=np.float64)
     npixels = np.ones(shape[0], dtype=np.float64)
     npixels_bkg = np.ones(shape[0], dtype=np.float64)
+    f_var_poisson = np.zeros(shape[0], dtype=np.float64)
+    f_var_rnoise = np.zeros(shape[0], dtype=np.float64)
+    f_var_flat = np.zeros(shape[0], dtype=np.float64)
+    b_var_poisson = np.zeros(shape[0], dtype=np.float64)
+    b_var_rnoise = np.zeros(shape[0], dtype=np.float64)
+    b_var_flat = np.zeros(shape[0], dtype=np.float64)
 
     dq = np.zeros(shape[0], dtype=np.uint32)
 
@@ -505,12 +574,36 @@ def extract_ifu(input_model, source_type, extract_params):
                                          method=method, subpixels=subpixels)
         temp_flux[k] = float(phot_table['aperture_sum'][0])
 
+        var_poisson_table = aperture_photometry(var_poisson[k, :, :], aperture,
+                                                method=method, subpixels=subpixels)
+        f_var_poisson[k] = float(var_poisson_table['aperture_sum'][0])
+
+        var_rnoise_table = aperture_photometry(var_rnoise[k, :, :], aperture,
+                                               method=method, subpixels=subpixels)
+        f_var_rnoise[k] = float(var_rnoise_table['aperture_sum'][0])
+
+        var_flat_table = aperture_photometry(var_flat[k, :, :], aperture,
+                                             method=method, subpixels=subpixels)
+        f_var_flat[k] = float(var_flat_table['aperture_sum'][0])
+
         # Point source type of data with defined annulus size
         if subtract_background_plane:
             bkg_table = aperture_photometry(data[k, :, :], annulus,
                                             method=method, subpixels=subpixels)
             background[k] = float(bkg_table['aperture_sum'][0])
             temp_flux[k] = temp_flux[k] - background[k] * normalization
+
+            var_poisson_table = aperture_photometry(var_poisson[k, :, :], annulus,
+                                                    method=method, subpixels=subpixels)
+            b_var_poisson[k] = float(var_poisson_table['aperture_sum'][0])
+
+            var_rnoise_table = aperture_photometry(var_rnoise[k, :, :], annulus,
+                                                   method=method, subpixels=subpixels)
+            b_var_rnoise[k] = float(var_rnoise_table['aperture_sum'][0])
+
+            var_flat_table = aperture_photometry(var_flat[k, :, :], annulus,
+                                                 method=method, subpixels=subpixels)
+            b_var_flat[k] = float(var_flat_table['aperture_sum'][0])
 
         # Extended source data - background determined from sigma clipping
         if source_type == 'EXTENDED':
@@ -534,16 +627,39 @@ def extract_ifu(input_model, source_type, extract_params):
                                              method=method, subpixels=subpixels)
             npixels_bkg[k] = float(phot_table['aperture_sum'][0])
 
+            var_poisson_table = aperture_photometry(var_poisson[k, :, :], aperture, mask=maskclip,
+                                                    method=method, subpixels=subpixels)
+            b_var_poisson[k] = float(var_poisson_table['aperture_sum'][0])
+
+            var_rnoise_table = aperture_photometry(var_rnoise[k, :, :], aperture, mask=maskclip,
+                                                   method=method, subpixels=subpixels)
+            b_var_rnoise[k] = float(var_rnoise_table['aperture_sum'][0])
+
+            var_flat_table = aperture_photometry(var_flat[k, :, :], aperture, mask=maskclip,
+                                                 method=method, subpixels=subpixels)
+            b_var_flat[k] = float(var_flat_table['aperture_sum'][0])
+
         del temp_weightmap
         # done looping over wavelength bins
     # Check for NaNs in the wavelength array, flag them in the dq array,
     # and truncate the arrays if NaNs are found at endpoints (unless the
     # entire array is NaN).
-    (wavelength, temp_flux, background, npixels, dq, npixels_bkg) = \
-        nans_in_wavelength(wavelength, temp_flux, background, npixels, dq, npixels_bkg)
 
-    return (ra, dec, wavelength, temp_flux, background, npixels, dq,
-            npixels_bkg, radius_match, x_center, y_center)
+    wavelength, dq, nan_slc = nans_in_wavelength(wavelength, dq)
+    temp_flux = temp_flux[nan_slc]
+    background = background[nan_slc]
+    npixels = npixels[nan_slc]
+    npixels_bkg = npixels_bkg[nan_slc]
+    f_var_poisson = f_var_poisson[nan_slc]
+    f_var_rnoise = f_var_rnoise[nan_slc]
+    f_var_flat = f_var_flat[nan_slc]
+    b_var_poisson = b_var_poisson[nan_slc]
+    b_var_rnoise = b_var_rnoise[nan_slc]
+    b_var_flat = b_var_flat[nan_slc]
+
+    return (ra, dec, wavelength, temp_flux, f_var_poisson, f_var_rnoise, f_var_flat,
+            background, b_var_poisson, b_var_rnoise, b_var_flat,
+            npixels, dq, npixels_bkg, radius_match, x_center, y_center)
 
 
 def locn_from_wcs(input_model, ra_targ, dec_targ):
@@ -688,9 +804,33 @@ def image_extract_ifu(input_model, source_type, extract_params):
         `surf_bright` (surface brightness) column, and multiplying by
         the solid angle of a pixel will give the flux for a point source.
 
+    f_var_poisson : ndarray, 1-D
+        The extracted poisson variance values to go along with the
+        temp_flux array.
+
+    f_var_rnoise : ndarray, 1-D
+        The extracted read noise variance values to go along with the
+        temp_flux array.
+
+    f_var_flat : ndarray, 1-D
+        The extracted flat field variance values to go along with the
+        temp_flux array.
+
     background : ndarray, 1-D
         The background count rate that was subtracted from the total
         source data values to get `temp_flux`.
+
+    b_var_poisson : ndarray, 1-D
+        The extracted poisson variance values to go along with the
+        background array.
+
+    b_var_rnoise : ndarray, 1-D
+        The extracted read noise variance values to go along with the
+        background array.
+
+    b_var_flat : ndarray, 1-D
+        The extracted flat field variance values to go along with the
+        background array.
 
     npixels : ndarray, 1-D, float64
         For each slice, this is the number of pixels that were added
@@ -708,14 +848,20 @@ def image_extract_ifu(input_model, source_type, extract_params):
     """
 
     data = input_model.data
+    try:
+        var_poisson = input_model.var_poisson
+        var_rnoise = input_model.var_rnoise
+        var_flat = input_model.var_flat
+    except AttributeError:
+        var_poisson = np.zeros_like(input_model.data)
+        var_rnoise = np.zeros_like(input_model.data)
+        var_flat = np.zeros_like(input_model.data)
     # The axes are (z, y, x) in the sense that (x, y) are the ordinary
     # axes of the image for one plane, i.e. at one wavelength.  The
     # wavelengths vary along the z-axis.
     shape = data.shape
 
     # The dispersion direction is the first axis.
-    temp_flux = np.zeros(shape[0], dtype=np.float64)
-    background = np.zeros(shape[0], dtype=np.float64)
     npixels = np.ones(shape[0], dtype=np.float64)
     n_bkg = np.ones(shape[0], dtype=np.float64)
 
@@ -778,6 +924,9 @@ def image_extract_ifu(input_model, source_type, extract_params):
     # First add up the values along the x direction, then add up the
     # values along the y direction.
     gross = (data * mask_target).sum(axis=2, dtype=np.float64).sum(axis=1)
+    f_var_poisson = (var_poisson * mask_target).sum(axis=2, dtype=np.float64).sum(axis=1)
+    f_var_rnoise = (var_rnoise * mask_target).sum(axis=2, dtype=np.float64).sum(axis=1)
+    f_var_flat = (var_flat * mask_target).sum(axis=2, dtype=np.float64).sum(axis=1)
 
     # Compute the number of pixels that were added together to get gross.
     normalization = 1.
@@ -795,16 +944,25 @@ def image_extract_ifu(input_model, source_type, extract_params):
             n_bkg[:] = np.where(n_bkg <= 0., 1., n_bkg)
             normalization = npixels / n_bkg
             background = (data * mask_bkg).sum(axis=2, dtype=np.float64).sum(axis=1)
+            b_var_poisson = (var_poisson * mask_bkg).sum(axis=2, dtype=np.float64).sum(axis=1)
+            b_var_rnoise = (var_rnoise * mask_bkg).sum(axis=2, dtype=np.float64).sum(axis=1)
+            b_var_flat = (var_flat * mask_bkg).sum(axis=2, dtype=np.float64).sum(axis=1)
             temp_flux = gross - background * normalization
         else:
             background = np.zeros_like(gross)
+            b_var_poisson = np.zeros_like(gross)
+            b_var_rnoise = np.zeros_like(gross)
+            b_var_flat = np.zeros_like(gross)
             temp_flux = gross.copy()
     else:
         temp_flux = (data * mask_target).sum(axis=2, dtype=np.float64).sum(axis=1)
 
     # Extended source data, sigma clip outliers of extraction region is performed
     # at each wavelength plane.
-        (background, n_bkg) = sigma_clip_extended_region(data, mask_target, temp_weightmap, bkg_sigma_clip)
+        (background, b_var_poisson, b_var_rnoise,
+         b_var_flat, n_bkg) = sigma_clip_extended_region(data, var_poisson, var_rnoise,
+                                                         var_flat, mask_target,
+                                                         temp_weightmap, bkg_sigma_clip)
 
     del temp_weightmap
 
@@ -826,10 +984,21 @@ def image_extract_ifu(input_model, source_type, extract_params):
     # Check for NaNs in the wavelength array, flag them in the dq array,
     # and truncate the arrays if NaNs are found at endpoints (unless the
     # entire array is NaN).
-    (wavelength, temp_flux, background, npixels, dq, n_bkg) = \
-        nans_in_wavelength(wavelength, temp_flux, background, npixels, dq, n_bkg)
+    wavelength, dq, nan_slc = nans_in_wavelength(wavelength, dq)
+    temp_flux = temp_flux[nan_slc]
+    background = background[nan_slc]
+    npixels = npixels[nan_slc]
+    n_bkg = n_bkg[nan_slc]
+    f_var_poisson = f_var_poisson[nan_slc]
+    f_var_rnoise = f_var_rnoise[nan_slc]
+    f_var_flat = f_var_flat[nan_slc]
+    b_var_poisson = b_var_poisson[nan_slc]
+    b_var_rnoise = b_var_rnoise[nan_slc]
+    b_var_flat = b_var_flat[nan_slc]
 
-    return (ra, dec, wavelength, temp_flux, background, npixels, dq, n_bkg, x_center, y_center)
+    return (ra, dec, wavelength, temp_flux, f_var_poisson, f_var_rnoise, f_var_flat,
+            background, b_var_poisson, b_var_rnoise, b_var_flat,
+            npixels, dq, n_bkg, x_center, y_center)
 
 
 def get_coordinates(input_model, x0, y0):
@@ -881,7 +1050,7 @@ def get_coordinates(input_model, x0, y0):
     return (ra, dec, wavelength)
 
 
-def nans_in_wavelength(wavelength, flux, background, npixels, dq, npixels_bkg):
+def nans_in_wavelength(wavelength, dq):
     """Check for NaNs in the wavelength array.
 
     If NaNs are found in the wavelength array, flag them in the dq array,
@@ -893,50 +1062,30 @@ def nans_in_wavelength(wavelength, flux, background, npixels, dq, npixels_bkg):
     wavelength : ndarray, 1-D, float64
         The wavelength in micrometers at each pixel.
 
-    flux : ndarray, 1-D, float64
-        The flux minus the background at each pixel.
-
-    background : ndarray, 1-D, float64
-        The background count rate that was subtracted from the total
-        source count rate to get `flux`.
-
-    npixels : ndarray, 1-D, float64
-        For each slice, this is the number of pixels that were added
-        together to get `flux`.
-
     dq : ndarray, 1-D, uint32
         The data quality array.
-
-    npixels_bkg : ndarray, 1-D, float64
-        For each slice, this is the number of pixels that were added
-        together to get `flux` for the annulus region
 
     Returns
     -------
     wavelength : ndarray, 1-D, float64
 
-    flux : ndarray, 1-D, float64
-
-    background : ndarray, 1-D, float64
-
-    npixels : ndarray, 1-D, float64
-
     dq : ndarray, 1-D, uint32
 
-    npixels_bkg : ndarray, 1-D, float64
+    slc : slice
     """
 
     nelem = np.size(wavelength)
+    slc = slice(nelem)
     if nelem == 0:
         log.warning("Output arrays are empty!")
-        return (wavelength, flux, background, npixels, dq, npixels_bkg)
+        return (wavelength, dq, slice(nelem))
 
     nan_mask = np.isnan(wavelength)
     n_nan = nan_mask.sum(dtype=np.intp)
     if n_nan == nelem:
         log.warning("Wavelength array is all NaN!")
         dq = np.bitwise_or(dq[:], dqflags.pixel['DO_NOT_USE'])
-        return (wavelength, flux, background, npixels, dq, npixels_bkg)
+        return (wavelength, dq, slice(0))
 
     if n_nan > 0:
         log.warning("%d NaNs in wavelength array.", n_nan)
@@ -948,15 +1097,11 @@ def nans_in_wavelength(wavelength, flux, background, npixels, dq, npixels_bkg):
             if n_trimmed > 0:
                 slc = slice(flag[0][0], flag[0][-1] + 1)
                 wavelength = wavelength[slc]
-                flux = flux[slc]
-                background = background[slc]
-                npixels = npixels[slc]
-                npixels_bkg = npixels_bkg[slc]
                 dq = dq[slc]
                 log.info("Output arrays have been trimmed by %d elements",
                          n_trimmed)
 
-    return (wavelength, flux, background, npixels, dq, npixels_bkg)
+    return wavelength, dq, slc
 
 
 def separate_target_and_background(ref):
@@ -1113,13 +1258,22 @@ def shift_ref_image(mask, delta_y, delta_x, fill=0):
     return temp
 
 
-def sigma_clip_extended_region(data, mask_targ, wmap, sigma_clip):
+def sigma_clip_extended_region(data, var_poisson, var_rnoise, var_flat, mask_targ, wmap, sigma_clip):
     """ sigma clip the extraction region
 
     Parameters
     ----------
     data : ndarray, 3-D
         Input data array to perform extraction from
+
+    var_poisson : ndarray, 2-D
+        Poisson noise variance array to be extracted following data extraction method.
+
+    var_rnoise : ndarray, 2-D
+        Read noise variance array to be extracted following data extraction method.
+
+    var_flat : ndarray, 2-D
+        Flat noise variance array to be extracted following data extraction method.
 
     mask_targ : ndarray, 2-D or 3-D
         Mask of pixels defining the extended source region. A value of 1 indicated
@@ -1132,6 +1286,9 @@ def sigma_clip_extended_region(data, mask_targ, wmap, sigma_clip):
     Returns
     -------
     sigma_clip_region : ndarray, 1-D. Summed extracted region with sigma clipping for each wavelength plane
+    d_var_poisson : ndarray, 1-D. Sigma-clipped var_poisson array
+    d_var_rnoise : ndarray, 1-D. Sigma-clipped var_rnoise array
+    d_var_flat : ndarray, 1-D. Sigma-clipped var_flat array
     n_bkg : ndarray, 1-D, sum of pixels used in sigma clipped extracted region
     """
     shape = data.shape
@@ -1139,6 +1296,9 @@ def sigma_clip_extended_region(data, mask_targ, wmap, sigma_clip):
     n_bkg = np.ones(shape[0], dtype=np.float64)
 
     sigma_clip_region = np.zeros(shape[0], dtype=np.float64)
+    d_var_poisson = np.zeros(shape[0], dtype=np.float64)
+    d_var_rnoise = np.zeros(shape[0], dtype=np.float64)
+    d_var_flat = np.zeros(shape[0], dtype=np.float64)
 
     # for each wavelength plane mark outliers as 0 in mask_bkg
     for k in range(shape[0]):  # looping over wavelength
@@ -1147,6 +1307,9 @@ def sigma_clip_extended_region(data, mask_targ, wmap, sigma_clip):
         else:
             extract_region = mask_targ[k, :, :].copy()
         data_plane = data[k, :, :]
+        var_poisson_plane = var_poisson[k, :, :]
+        var_rnoise_plane = var_rnoise[k, :, :]
+        var_flat_plane = var_flat[k, :, :]
         # pull out extract source region to determined stats on for sigma clipping
         extract_data = data_plane[extract_region == 1]
         ext_mean, _, ext_stddev = stats.sigma_clipped_stats(extract_data,
@@ -1159,6 +1322,9 @@ def sigma_clip_extended_region(data, mask_targ, wmap, sigma_clip):
         extract_region[maskclip] = 0
 
         sigma_clip_region[k] = np.sum(data_plane * extract_region * wmap[k, :, :])
+        d_var_poisson[k] = np.sum(var_poisson_plane * extract_region * wmap[k, :, :])
+        d_var_rnoise[k] = np.sum(var_rnoise_plane * extract_region * wmap[k, :, :])
+        d_var_flat[k] = np.sum(var_flat_plane * extract_region * wmap[k, :, :])
         n_bkg[k] = np.sum(wmap[k, :, :] * extract_region)
 
-    return sigma_clip_region, n_bkg
+    return sigma_clip_region, d_var_poisson, d_var_rnoise, d_var_flat, n_bkg

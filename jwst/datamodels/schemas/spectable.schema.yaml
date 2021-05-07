@@ -9,17 +9,35 @@ datatype:
   datatype: float64
 - name: FLUX
   datatype: float64
-- name: ERROR
+- name: FLUX_ERROR
+  datatype: float64
+- name: FLUX_VAR_POISSON
+  datatype: float64
+- name: FLUX_VAR_RNOISE
+  datatype: float64
+- name: FLUX_VAR_FLAT
   datatype: float64
 - name: SURF_BRIGHT
   datatype: float64
 - name: SB_ERROR
   datatype: float64
+- name: SB_VAR_POISSON
+  datatype: float64
+- name: SB_VAR_RNOISE
+  datatype: float64
+- name: SB_VAR_FLAT
+  datatype: float64
 - name: DQ
   datatype: uint32
 - name: BACKGROUND
   datatype: float64
-- name: BERROR
+- name: BKGD_ERROR
+  datatype: float64
+- name: BKGD_VAR_POISSON
+  datatype: float64
+- name: BKGD_VAR_RNOISE
+  datatype: float64
+- name: BKGD_VAR_FLAT
   datatype: float64
 - name: NPIXELS
   datatype: float64

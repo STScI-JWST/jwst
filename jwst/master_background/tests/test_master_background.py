@@ -106,7 +106,7 @@ def test_copy_background_to_surf_bright():
     data = create_background(wavelength, surf_bright)
     data.spec[0].spec_table['sb_error'] = sb_error
     data.spec[0].spec_table['background'] = background
-    data.spec[0].spec_table['berror'] = berror
+    data.spec[0].spec_table['bkgd_error'] = berror
 
     newdata = data.copy()
     copy_background_to_surf_bright(newdata)

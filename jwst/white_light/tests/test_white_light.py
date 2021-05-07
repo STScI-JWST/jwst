@@ -20,27 +20,40 @@ def make_datamodel():
     # Make data arrays
     flux = np.random.rand(200) * 1e-9
     wavelength = np.arange(11, 13, step=0.01)
-    error = np.random.rand(200)
+    f_var_poisson = np.random.rand(200)
+    f_var_rnoise = np.random.rand(200)
+    f_var_flat = np.random.rand(200)
+    error = np.sqrt(f_var_poisson + f_var_rnoise + f_var_flat)
+
     surf_bright = np.zeros(200)
     sb_error = np.zeros(200)
+    sb_var_poisson = sb_error.copy()
+    sb_var_rnoise = sb_error.copy()
+    sb_var_flat = sb_error.copy()
     dq = np.ones(200)
     background = np.zeros(200)
     berror = np.zeros(200)
+    b_var_poisson = sb_error.copy()
+    b_var_rnoise = sb_error.copy()
+    b_var_flat = sb_error.copy()
     npixels = np.zeros(200)
 
-    data = [(i, j, k, l, m, n, o, p, q) for i, j, k, l, m, n, o, p, q in zip(wavelength, flux, error,
-                                                                             surf_bright, sb_error, dq,
-                                                                             background, berror, npixels)]
+    spec_dtype = datamodels.SpecModel().spec_table.dtype  # This data type is used for creating an output table.
 
-    spec_table = np.array(data, dtype=[('WAVELENGTH', 'f8'), ('FLUX', 'f8'),
-                                       ('ERROR', 'f8'), ('SURF_BRIGHT', 'f8'),
-                                       ('SB_ERROR', 'f8'), ('DQ', 'u4'), ('BACKGROUND', 'f8'),
-                                       ('BERROR', 'f8'), ('NPIXELS', 'f8')])
+    otab = np.array(
+        list(
+            zip(
+                 wavelength, flux, error, f_var_poisson, f_var_rnoise, f_var_flat,
+                 surf_bright, sb_error, sb_var_poisson, sb_var_rnoise, sb_var_flat,
+                 dq, background, berror, b_var_poisson, b_var_rnoise, b_var_flat,
+                 npixels
+            ),
+        ), dtype=spec_dtype
+    )
 
-    spectrum = datamodels.SpecModel()
-    spectrum.spec_table = spec_table
+    spec_model = datamodels.SpecModel(spec_table=otab)
 
-    model.spec.append(spectrum)
+    model.spec.append(spec_model)
 
     integrations = [(1, 58627.53891071, 58627.53896565, 58627.5390206, 0., 0., 0.),
                     (2, 58627.5390206, 58627.53907555, 58627.5391305, 0., 0., 0.),
@@ -53,7 +66,7 @@ def make_datamodel():
                                                       ('int_start_BJD_TDB', 'f8'),
                                                       ('int_mid_BJD_TDB', 'f8'),
                                                       ('int_end_BJD_TDB', 'f8')])
-    model.int_times = (integration_table)
+    model.int_times = integration_table
 
     return model
 

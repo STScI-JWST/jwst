@@ -17,7 +17,7 @@ class InputSpectrumModel:
     """Attributes:
         wavelength
         flux
-        error
+        flux_error
         surf_bright
         sb_error
         dq
@@ -51,7 +51,7 @@ class InputSpectrumModel:
         self.wavelength = spec.spec_table.field("wavelength").copy()
 
         self.flux = spec.spec_table.field("flux").copy()
-        self.error = spec.spec_table.field("error").copy()
+        self.flux_error = spec.spec_table.field("flux_error").copy()
         try:
             self.surf_bright = spec.spec_table.field("surf_bright").copy()
             self.sb_error = spec.spec_table.field("sb_error").copy()
@@ -87,7 +87,7 @@ class InputSpectrumModel:
     def close(self):
         self.wavelength = None
         self.flux = None
-        self.error = None
+        self.flux_error = None
         self.surf_bright = None
         self.sb_error = None
         self.dq = None
@@ -103,7 +103,7 @@ class OutputSpectrumModel:
     """Attributes:
         wavelength
         flux
-        error
+        flux_error
         surf_bright
         sb_error
         dq
@@ -117,7 +117,7 @@ class OutputSpectrumModel:
 
         self.wavelength = None
         self.flux = None
-        self.error = None
+        self.flux_error = None
         self.surf_bright = None
         self.sb_error = None
         self.dq = None
@@ -181,7 +181,7 @@ class OutputSpectrumModel:
         nelem = self.wavelength.shape[0]
 
         self.flux = np.zeros(nelem, dtype=np.float64)
-        self.error = np.zeros(nelem, dtype=np.float64)
+        self.flux_error = np.zeros(nelem, dtype=np.float64)
         self.surf_bright = np.zeros(nelem, dtype=np.float64)
         self.sb_error = np.zeros(nelem, dtype=np.float64)
         self.dq = np.zeros(nelem, dtype=dq_dtype)
@@ -214,7 +214,7 @@ class OutputSpectrumModel:
                 weight = in_spec.weight[i]
                 self.dq[k] |= in_spec.dq[i]
                 self.flux[k] += in_spec.flux[i] * weight
-                self.error[k] += (in_spec.error[i] * weight)**2
+                self.flux_error[k] += (in_spec.flux_error[i] * weight)**2
                 self.surf_bright[k] += (in_spec.surf_bright[i] * weight)
                 self.sb_error[k] += (in_spec.sb_error[i] * weight)**2
                 self.weight[k] += weight
@@ -234,7 +234,7 @@ class OutputSpectrumModel:
             log.warning("    these elements will be omitted.")
             self.wavelength = self.wavelength[index]
             self.flux = self.flux[index]
-            self.error = self.error[index]
+            self.flux_error = self.flux_error[index]
             self.surf_bright = self.surf_bright[index]
             self.sb_error = self.sb_error[index]
             self.dq = self.dq[index]
@@ -251,7 +251,7 @@ class OutputSpectrumModel:
             sum_weight = np.where(self.weight > 0., self.weight, 1.)
             self.surf_bright /= sum_weight
             self.flux /= sum_weight
-            self.error = np.sqrt(self.error / sum_weight)
+            self.flux_error = np.sqrt(self.flux_error / sum_weight)
             self.sb_error = np.sqrt(self.sb_error / sum_weight)
             self.normalized = True
 
@@ -273,7 +273,7 @@ class OutputSpectrumModel:
         # Note that these arrays have to be in the right order.
         data = np.array(list(zip(self.wavelength,
                                  self.flux,
-                                 self.error,
+                                 self.flux_error,
                                  self.surf_bright,
                                  self.sb_error,
                                  self.dq,
@@ -286,7 +286,7 @@ class OutputSpectrumModel:
     def close(self):
         self.wavelength = None
         self.flux = None
-        self.error = None
+        self.flux_error = None
         self.surf_bright = None
         self.sb_error = None
         self.dq = None

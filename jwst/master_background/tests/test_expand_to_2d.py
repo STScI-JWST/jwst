@@ -136,6 +136,7 @@ def user_bkg_spec_a():
                               dtype=np.float64)
     flux = np.zeros_like(wavelength)
     error = np.ones_like(wavelength)
+    var_dummy = error.copy()
     surf_bright = np.linspace(13., 25., num=25, endpoint=True, retstep=False,
                               dtype=np.float64)
     sb_error = np.ones_like(wavelength)
@@ -145,9 +146,10 @@ def user_bkg_spec_a():
     # The npixels column should no longer be used.  Set it to a large value
     # to make it more obvious in case it actually is still used.
     npixels = np.zeros_like(wavelength) + 2000.
-    otab = np.array(list(zip(wavelength, flux, error,
-                             surf_bright, sb_error, dq, background, berror,
-                             npixels)),
+    otab = np.array(list(zip(wavelength, flux, error, var_dummy, var_dummy,
+                             var_dummy, surf_bright, sb_error, var_dummy,
+                             var_dummy, var_dummy, dq, background, berror,
+                             var_dummy, var_dummy, var_dummy, npixels)),
                     dtype=spec_dtype)
     spec = datamodels.SpecModel(spec_table=otab)
     m_bkg_spec.spec.append(spec)
@@ -179,6 +181,7 @@ def user_bkg_spec_b():
                               dtype=np.float64)[::-1]
     flux = np.zeros_like(wavelength)
     error = np.ones_like(wavelength)
+    var_dummy = error.copy()
     surf_bright = np.linspace(13., 25., num=25, endpoint=True, retstep=False,
                               dtype=np.float64)[::-1]
     sb_error = np.ones_like(wavelength)
@@ -186,9 +189,10 @@ def user_bkg_spec_b():
     background = np.ones_like(wavelength)
     berror = np.ones_like(wavelength)
     npixels = np.ones_like(wavelength)
-    otab = np.array(list(zip(wavelength, flux, error,
-                             surf_bright, sb_error, dq, background, berror,
-                             npixels)),
+    otab = np.array(list(zip(wavelength, flux, error, var_dummy, var_dummy,
+                             var_dummy, surf_bright, sb_error, var_dummy,
+                             var_dummy, var_dummy, dq, background, berror,
+                             var_dummy, var_dummy, var_dummy, npixels)),
                     dtype=spec_dtype)
     spec = datamodels.SpecModel(spec_table=otab)
     m_bkg_spec.spec.append(spec)

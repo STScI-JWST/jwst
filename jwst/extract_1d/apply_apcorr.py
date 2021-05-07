@@ -153,7 +153,9 @@ class ApCorrBase(abc.ABC):
             Table of aperture corrections values from apcorr reference file.
 
         """
-        cols_to_correct = ('flux', 'surf_bright', 'error', 'sb_error')
+        cols_to_correct = ('flux', 'flux_error', 'flux_var_poisson', 'flux_var_rnoise',
+                           'flux_var_flat', 'surf_bright', 'sb_error', 'sb_var_poisson',
+                           'sb_var_rnoise', 'sb_var_flat')
 
         for row in spec_table:
             correction = self.apcorr_func(row['npixels'], row['wavelength'])
@@ -227,7 +229,9 @@ class ApCorrPhase(ApCorrBase):
             Table of aperture corrections values from apcorr reference file.
 
         """
-        cols_to_correct = ('flux', 'surf_bright', 'error', 'sb_error')
+        cols_to_correct = ('flux', 'flux_error', 'flux_var_poisson', 'flux_var_rnoise',
+                           'flux_var_flat', 'surf_bright', 'sb_error', 'sb_var_poisson',
+                           'sb_var_rnoise', 'sb_var_flat')
 
         for row in spec_table:
             try:
@@ -284,7 +288,9 @@ class ApCorrRadial(ApCorrBase):
             Table of aperture corrections values from apcorr reference file.
 
         """
-        cols_to_correct = ('flux', 'surf_bright', 'error', 'sb_error')
+        cols_to_correct = ('flux', 'flux_error', 'flux_var_poisson', 'flux_var_rnoise',
+                           'flux_var_flat', 'surf_bright', 'sb_error', 'sb_var_poisson',
+                           'sb_var_rnoise', 'sb_var_flat')
 
         for i, row in enumerate(spec_table):
             correction = self.apcorr_correction[i]

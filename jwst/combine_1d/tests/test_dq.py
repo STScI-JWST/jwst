@@ -38,20 +38,25 @@ def create_spec_model(npoints=10, flux=1e-9, wave_range=(11, 13)):
     error = np.zeros(npoints)
     surf_bright = np.zeros(npoints)
     sb_error = np.zeros(npoints)
+    var_dummy = error.copy()
     dq = np.zeros(npoints)
     background = np.zeros(npoints)
     berror = np.zeros(npoints)
     npixels = np.zeros(npoints)
 
-    data = [(i, j, k, l, m, n, o, p, q) for i, j, k, l, m, n, o, p, q in zip(wavelength, flux, error,
-                                                                             surf_bright, sb_error, dq,
-                                                                             background, berror, npixels)]
+    spec_dtype = datamodels.SpecModel().spec_table.dtype  # This data type is used for creating an output table.
 
-    spec_table = np.array(data, dtype=[('WAVELENGTH', 'f8'), ('FLUX', 'f8'),
-                                       ('ERROR', 'f8'), ('SURF_BRIGHT', 'f8'),
-                                       ('SB_ERROR', 'f8'), ('DQ', 'u4'), ('BACKGROUND', 'f8'),
-                                       ('BERROR', 'f8'), ('NPIXELS', 'f8')])
-    spec_model = datamodels.SpecModel()
-    spec_model.spec_table = spec_table
+    otab = np.array(
+        list(
+            zip(
+                wavelength, flux, error, var_dummy, var_dummy, var_dummy,
+                surf_bright, sb_error, var_dummy, var_dummy, var_dummy,
+                dq, background, berror, var_dummy, var_dummy, var_dummy,
+                npixels
+            ),
+        ), dtype=spec_dtype
+    )
+
+    spec_model = datamodels.SpecModel(spec_table=otab)
 
     return spec_model
