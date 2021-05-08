@@ -100,3 +100,13 @@ Package Documentation
    jwst/package_index.rst
 
 
+===
+FAQ
+===
+
+.. toctree::
+   :maxdepth: 1
+
+   jwst/faq.rst
+
+
