@@ -16,13 +16,8 @@ Resolves JP-
 This PR addresses ...
 
 
-Checklist
+Checklist:
+
 - [ ] Tests
-
 - [ ] Documentation
-
 - [ ] Change log
-
-- [ ] Milestone
-
-- [ ] Label(s)
