@@ -240,10 +240,10 @@ def tsgrism(input_model, reference_files):
     ycenter = Const1D(yc)
     ycenter.inverse = Const1D(yc)
 
-    setra = Const1D(input_model.meta.wcsinfo.crval1)
-    setra.inverse = Const1D(input_model.meta.wcsinfo.crval1)
-    setdec = Const1D(input_model.meta.wcsinfo.crval2)
-    setdec.inverse = Const1D(input_model.meta.wcsinfo.crval2)
+    setra = Const1D(input_model.meta.wcsinfo.ra_ref)
+    setra.inverse = Const1D(input_model.meta.wcsinfo.ra_ref)
+    setdec = Const1D(input_model.meta.wcsinfo.dec_ref)
+    setdec.inverse = Const1D(input_model.meta.wcsinfo.dec_ref)
 
     # x, y, order in goes to transform to full array location and order
     # get the shift to full frame coordinates

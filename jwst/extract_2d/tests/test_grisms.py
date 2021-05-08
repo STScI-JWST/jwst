@@ -222,7 +222,6 @@ def test_create_box_fits():
             assert [1] == list(ids[0].order_bounding.keys())
 
 
-@pytest.mark.xfail(reason='NIRCam distortion reffile')
 def test_create_box_gwcs():
     """Make sure that a box is created around a source catalog object.
     This version allows use of the GWCS to translate the source location.
@@ -316,6 +315,19 @@ def test_extract_tso_subarray():
     # not the size of the cutout
     assert outmodel.ysize > 0
     assert outmodel.xsize > 0
+    with pytest.raises(TypeError):
+        extract_tso_object(wcsimage, reference_files=refs,
+                           extract_orders=1)
+    with pytest.raises(TypeError):
+        extract_tso_object(wcsimage, reference_files=refs,
+                           extract_orders=['1'])
+    with pytest.raises(NotImplementedError):
+        extract_tso_object(wcsimage, reference_files=refs,
+                           extract_orders=[1, 2])
+    with pytest.raises(TypeError):
+        extract_tso_object(wcsimage, reference_files='myspecwcs.asdf')
+    with pytest.raises(KeyError):
+        extract_tso_object(wcsimage, reference_files={})
     del outmodel
 
 
@@ -362,7 +374,6 @@ def test_extract_wfss_object():
     The data is all ones, this just tests extraction
     on the detector of expected locations.
 
-    TODO:  set use_fits_wcs to False when ready
     """
     source_catalog = get_file_path('step_SourceCatalogStep_cat.ecsv')
     wcsimage = create_wfss_image(pupil='GRISMR')
@@ -378,6 +389,17 @@ def test_extract_wfss_object():
 
     names = [slit.name for slit in outmodel.slits]
     assert names == ['9', '19', '19']
+
+    with pytest.raises(TypeError):
+        extract_tso_object(wcsimage, reference_files='myspecwcs.asdf')
+    with pytest.raises(KeyError):
+        extract_tso_object(wcsimage, reference_files={})
+    with pytest.raises(ValueError):
+        wcsimage.meta.exposure.type = 'NIS_IMAGE'
+        extract_tso_object(wcsimage, reference_files=refs)
+    with pytest.raises(ValueError):
+        wcsimage.meta.instrument.name = 'NIRISS'
+        extract_tso_object(wcsimage, reference_files=refs)
 
 
 def test_wfss_extract_custom_height():

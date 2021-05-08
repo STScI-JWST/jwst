@@ -77,21 +77,20 @@ def extract_tso_object(input_model,
         raise TypeError("Expected a dictionary for reference_files")
 
     # Check for wavelengthrange reference file
-    if 'wavelengthrange' not in reference_files.keys():
+    if 'wavelengthrange' not in reference_files:
         raise KeyError("No wavelengthrange reference file specified")
 
     # If an extraction height is not supplied, default to entire
     # cross-dispersion size of the data array
     if tsgrism_extract_height is None:
         tsgrism_extract_height = input_model.meta.subarray.ysize
-    log.info(f"Setting extraction height to {tsgrism_extract_height}")
+    log.info("Setting extraction height to {}".format(tsgrism_extract_height))
 
     # Get the disperser parameters that have the wave limits
     with WavelengthrangeModel(reference_files['wavelengthrange']) as f:
-        if (f.meta.instrument.name != 'NIRCAM'):
-            raise ValueError("Wavelengthrange reference file not for NIRCAM!")
-        if (f.meta.exposure.type != 'NRC_TSGRISM'):
-            raise ValueError("Wavelengthrange reference file not for TSGRISM")
+        if (f.meta.instrument.name != 'NIRCAM' or
+                f.meta.exposure.type != 'NRC_TSGRISM'):
+            raise ValueError("Wavelengthrange reference file is not for NIRCAM TSGRISM mode!")
         wavelengthrange = f.wavelengthrange
         ref_extract_orders = f.extract_orders
 
@@ -100,24 +99,22 @@ def extract_tso_object(input_model,
     if extract_orders is None:
         log.info("Using default order extraction from reference file")
         extract_orders = ref_extract_orders
-        available_orders = [x[1] for x in extract_orders if x[0] == input_model.meta.instrument.filter].pop()
+        available_orders = [x[1] for x in extract_orders if
+                            x[0] == input_model.meta.instrument.filter].pop()
     else:
-        if isinstance(extract_orders, list):
-            if not all(isinstance(item, int) for item in extract_orders):
-                raise TypeError("Expected extract_orders to be a list of ints")
-        else:
-            raise TypeError("Expected extract_orders to be a list of ints")
+        if (not isinstance(extract_orders, list) or
+                not all(isinstance(item, int) for item in extract_orders)):
+            raise TypeError("Expected extract_orders to be a list of integers.")
         available_orders = extract_orders
 
     if len(available_orders) > 1:
-        raise NotImplementedError("Multiple order extraction for TSO not currently implemented")
+        raise NotImplementedError("Multiple order extraction for TSO is "
+                                  "not currently implemented.")
 
     # Check for the existence of the aperture reference location meta data
-    if input_model.meta.wcsinfo.siaf_xref_sci is None:
-        raise ValueError('XREF_SCI is missing.')
-
-    if input_model.meta.wcsinfo.siaf_yref_sci is None:
-        raise ValueError('YREF_SCI is missing.')
+    if (input_model.meta.wcsinfo.siaf_xref_sci is None or
+            input_model.meta.wcsinfo.siaf_yref_sci is None):
+        raise ValueError('XREF_SCI and YREF_SCI are required for TSO mode.')
 
     # Create the extracted output as a SlitModel
     log.info("Extracting order: {}".format(available_orders))
@@ -127,7 +124,8 @@ def extract_tso_object(input_model,
 
     # Loop over spectral orders
     for order in available_orders:
-        range_select = [(x[2], x[3]) for x in wavelengthrange if (x[0] == order and x[1] == input_model.meta.instrument.filter)]
+        range_select = [(x[2], x[3]) for x in wavelengthrange if
+                        (x[0] == order and x[1] == input_model.meta.instrument.filter)]
 
         # Use the filter that was in front of the grism for translation
         lmin, lmax = range_select.pop()
@@ -173,7 +171,7 @@ def extract_tso_object(input_model,
             extract_y_max = extract_y_center + tsgrism_extract_height - 34 - 1
 
         # Check for bad results
-        if (extract_y_min > extract_y_max):
+        if extract_y_min > extract_y_max:
             raise ValueError("Something bad happened calculating extraction y-size")
 
         # Limit the bounding box to the detector edges
@@ -208,8 +206,10 @@ def extract_tso_object(input_model,
         ymax = int(ymax)
 
         log.info("WCS made explicit for order: {}".format(order))
-        log.info("Spectral trace extents: (xmin:{}, ymin:{}), (xmax:{}, ymax:{})".format(xmin, ymin, xmax, ymax))
-        log.info("Extraction limits: (xmin:{}, ymin:{}), (xmax:{}, ymax:{})".format(xmin_ext, ymin, xmax_ext, ymax))
+        log.info("Spectral trace extents: (xmin: {}, ymin: {}), "
+                 "(xmax: {}, ymax: {})".format(xmin, ymin, xmax, ymax))
+        log.info("Extraction limits: (xmin: {}, ymin: {}), "
+                 "(xmax: {}, ymax: {})".format(xmin_ext, ymin, xmax, ymax))
 
         # Cut out the subarray from the input data arrays
         ext_data = input_model.data[..., ymin: ymax + 1, xmin_ext:xmax_ext + 1].copy()
@@ -347,15 +347,12 @@ def extract_grism_objects(input_model,
             variable. The cross-dispersion size is taken from the minimum
             bounding box.
     """
-    if reference_files is None:
+    if reference_files is None or not reference_files:
         raise TypeError("Expected a dictionary for reference_files")
 
     if grism_objects is None:
         # get the wavelengthrange reference file from the input_model
-        if reference_files is None:
-            raise ValueError("Need at least the dictionary of reference files")
-
-        if (not reference_files['wavelengthrange'] or reference_files['wavelengthrange'] == 'N/A'):
+        if ('wavelengthrange' not in reference_files or reference_files['wavelengthrange'] in ['N/A', '']):
             raise ValueError("Expected name of wavelengthrange reference file")
         else:
             grism_objects = util.create_grism_bbox(input_model, reference_files,
@@ -418,7 +415,8 @@ def extract_grism_objects(input_model,
             if (((ymax - ymin) > 0) and ((xmax - xmin) > 0)):
                 subwcs = copy.deepcopy(inwcs)
                 log.info("Subarray extracted for obj: {} order: {}:".format(obj.sid, order))
-                log.info("Subarray extents are: (xmin:{}, xmax:{}), (ymin:{}, ymax:{})".format(xmin, xmax, ymin, ymax))
+                log.info("Subarray extents are: "
+                         "(xmin:{}, xmax:{}), (ymin:{}, ymax:{})".format(xmin, xmax, ymin, ymax))
 
                 # only the first two numbers in the Mapping are used
                 # the order and source position are put directly into
@@ -467,9 +465,11 @@ def extract_grism_objects(input_model,
                 new_slit.meta.wcsinfo.spectral_order = order
                 new_slit.meta.wcsinfo.dispersion_direction = \
                     input_model.meta.wcsinfo.dispersion_direction
+                new_slit.meta.wcsinfo.specsys = input_model.meta.wcsinfo.specsys
+                new_slit.meta.coordinates = input_model.meta.coordinates
                 new_slit.meta.wcs = subwcs
                 if compute_wavelength:
-                    log.debug("Computing wavelengths (this takes a while ...)")
+                    log.debug("Computing wavelengths")
                     new_slit.wavelength = compute_wavelength_array(new_slit)
 
                 # set x/ystart values relative to the image (screen) frame.
