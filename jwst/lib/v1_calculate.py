@@ -38,9 +38,14 @@ def v1_calculate_from_models(sources, **calc_wcs_from_time_kwargs):
         with dm.open(source) as model:
             obsstart = model.meta.exposure.start_time
             obsend = model.meta.exposure.end_time
+            guide_star_wcs = stp.WCSRef(
+                model.meta.guidestar.gs_ra,
+                model.meta.guidestar.gs_dec,
+                model.meta.guidestar.gs_pa
+            )
 
             obstimes, _, vinfos = stp.calc_wcs_over_time(
-                obsstart, obsend, siaf=siaf, **calc_wcs_from_time_kwargs
+                obsstart, obsend, siaf=siaf, guide_star_wcs=guide_star_wcs, **calc_wcs_from_time_kwargs
             )
         sources = [source] * len(obstimes)
         v1_dict['source'] += sources

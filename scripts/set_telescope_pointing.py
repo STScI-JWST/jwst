@@ -41,14 +41,14 @@ DAMAGE.
 import argparse
 import logging
 
-from jwst.lib.set_telescope_pointing import add_wcs
+import jwst.lib.set_telescope_pointing as stp
 
+# Configure logging
 logger = logging.getLogger('jwst')
-handler = logging.StreamHandler()
-handler.setLevel(logging.DEBUG)
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-
+logger.propagate = False
+logger_handler = logging.StreamHandler()
+logger.addHandler(logger_handler)
+logger_format_debug = logging.Formatter('%(levelname)s:%(filename)s::%(funcName)s: %(message)s')
 
 if __name__ == '__main__':
 
@@ -58,6 +58,15 @@ if __name__ == '__main__':
     parser.add_argument(
         'exposure', type=str, nargs='+',
         help='List of JWST exposures to update.'
+    )
+    parser.add_argument(
+        '-v', '--verbose', action='count', default=0,
+        help='Increase verbosity. Specifying multiple times adds more output.'
+    )
+    parser.add_argument(
+        '--method',
+        type=stp.Methods, choices=list(stp.Methods), default=stp.Methods.default,
+        help='Algorithmic method to use. Default: %(default)s'
     )
     parser.add_argument(
         '--tolerance', type=int, default=60,
@@ -88,19 +97,27 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    # Set output detail.
+    level = stp.LOGLEVELS[min(len(stp.LOGLEVELS) - 1, args.verbose)]
+    logger.setLevel(level)
+    if level <= logging.DEBUG:
+        logger_handler.setFormatter(logger_format_debug)
+
+    # Calculate WCS for all inputs.
     for filename in args.exposure:
         logger.info(
             '\n------'
             'Setting pointing for {}'.format(filename)
         )
         try:
-            add_wcs(
+            stp.add_wcs(
                 filename,
                 siaf_path=args.siaf,
                 engdb_url=args.engdb_url,
                 tolerance=args.tolerance,
                 allow_default=args.allow_default,
                 dry_run=args.dry_run,
+                method=args.method,
                 j2fgs_transpose=args.transpose_j2fgs
             )
         except ValueError as exception:

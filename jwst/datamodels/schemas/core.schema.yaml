@@ -249,7 +249,7 @@ properties:
           pointing_engdb_quality:
             title: Quality of pointing information from EngDB
             type: string
-            enum: [CALCULATED, PLANNED]
+            enum: [CALCULATED_FULL, CALCULATED_FULLVA, CALCULATED_GSCMD, CALCULATED_GSCMD_V3PAGS, CALCULATED_ORIGINAL, PLANNED]
             fits_keyword: ENGQLPTG
             blend_table: True
           type:
@@ -1473,6 +1473,10 @@ properties:
             title: guide star declination
             type: number
             fits_keyword: GS_DEC
+            blend_table: True
+          gs_pa:
+            title: guide star V3 position angle
+            fits_keyword: GS_V3_PA
             blend_table: True
           gs_ura:
             title: guide star right ascension uncertainty

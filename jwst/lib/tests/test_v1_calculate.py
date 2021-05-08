@@ -43,7 +43,7 @@ def test_from_models(engdb):
     assert report_diff_values(truth, v1_formatted, fileobj=sys.stderr)
 
 
-def test_over_tiome(engdb):
+def test_over_time(engdb):
     """Test v1_calculate_over_time for basic running"""
     v1_table = v1c.v1_calculate_over_time(
         Time(GOOD_STARTTIME).mjd, Time(GOOD_ENDTIME).mjd

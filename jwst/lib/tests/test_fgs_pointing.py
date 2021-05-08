@@ -26,7 +26,7 @@ WCS_META = {
             'name': 'FGS1_FULL',
         },
         'observation': {
-            'date': '1/1/2017',
+            'date': '2017-01-01',
         }
     }
 }
@@ -36,10 +36,10 @@ def test_fgs_pointing():
     model = make_level1b()
     stp.update_wcs(model, siaf_path=siaf_db)
 
-    assert model.meta.wcsinfo.pc1_1 == -0.9997617223891989
-    assert model.meta.wcsinfo.pc1_2 == -0.02182884434372137
-    assert model.meta.wcsinfo.pc2_1 == -0.02182884434372137
-    assert model.meta.wcsinfo.pc2_2 == 0.9997617223891989
+    assert model.meta.wcsinfo.pc1_1 == -0.9997617158628777
+    assert model.meta.wcsinfo.pc1_2 == -0.021829143247382235
+    assert model.meta.wcsinfo.pc2_1 == -0.021829143247382235
+    assert model.meta.wcsinfo.pc2_2 == 0.9997617158628777
 
 
 # ---------

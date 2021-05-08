@@ -126,6 +126,8 @@ jump
 lib
 ---
 
+- Add guide star-based pointing algorithm to ``set_telescope_pointing.py``
+
 - Update ``update_mt_kwds`` function in ``set_telescope_pointing.py`` to  populate the TARG_RA/TARG_DEC [#5808]
 
 - moved ``basic_utils.multiple_replace`` to stcal. [#5898]

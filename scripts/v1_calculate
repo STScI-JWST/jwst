@@ -11,10 +11,12 @@ from astropy.time import Time
 from jwst.lib import v1_calculate
 import jwst.lib.set_telescope_pointing as stp
 
-log_handler = logging.StreamHandler()
+# Configure logging
 logger = logging.getLogger('jwst')
-logger.addHandler(log_handler)
-LOGLEVELS = [logging.WARNING, logging.INFO, logging.DEBUG]
+logger.propagate = False
+logger_handler = logging.StreamHandler()
+logger.addHandler(logger_handler)
+logger_format_debug = logging.Formatter('%(levelname)s:%(filename)s::%(funcName)s: %(message)s')
 
 # Available reduce functions
 REDUCE_FUNCS_MAPPING = {
@@ -49,6 +51,11 @@ if __name__ == '__main__':
               )
     )
     parser.add_argument(
+        '--method',
+        type=stp.Methods, choices=list(stp.Methods), default=stp.Methods.default,
+        help='Algorithmic method to use. Default: %(default)s'
+    )
+    parser.add_argument(
         '-v', '--verbose', action='count', default=0,
         help='Increase verbosity. Specifying multiple times adds more output.'
     )
@@ -63,8 +70,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Set output detail.
-    level = LOGLEVELS[min(len(LOGLEVELS)-1, args.verbose)]
+    level = stp.LOGLEVELS[min(len(stp.LOGLEVELS)-1, args.verbose)]
     logger.setLevel(level)
+    if level <= logging.DEBUG:
+        logger_handler.setFormatter(logger_format_debug)
 
     # Determine whether the sources are time specifications or a file list.
     if len(args.time_sources) == 2:
@@ -91,12 +100,14 @@ if __name__ == '__main__':
     if input_as_files:
         v1s = v1_calculate.v1_calculate_from_models(
             args.time_sources, engdb_url=args.engdb_url,
-            reduce_func=REDUCE_FUNCS_MAPPING[args.pointing]
+            reduce_func=REDUCE_FUNCS_MAPPING[args.pointing],
+            method=args.method
         )
     else:
         v1s = v1_calculate.v1_calculate_over_time(
             obsstart.mjd, obsend.mjd, engdb_url=args.engdb_url,
-            reduce_func=REDUCE_FUNCS_MAPPING[args.pointing]
+            reduce_func=REDUCE_FUNCS_MAPPING[args.pointing],
+            method=args.method
         )
 
     formatted = v1_calculate.simplify_table(v1s)

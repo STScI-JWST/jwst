@@ -1,0 +1,9 @@
+{
+    "TlmMnemonic": "SA_ZFGGSCMDY",
+    "AllPoints": 1,
+    "Count": 2,
+    "Data": [
+        {"ObsTime": "/Date(1388577600000)/", "EUValue": 0.0},
+        {"ObsTime": "/Date(1388750400000)/", "EUValue": 0.0}
+    ]
+}

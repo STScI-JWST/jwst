@@ -1,15 +1,22 @@
 """Set Telescope Pointing from quaternions"""
+import sys
+
+from collections import defaultdict, namedtuple
 from copy import copy
+from dataclasses import dataclass
+from datetime import date
+from enum import Enum
 import logging
-from math import (cos, sin)
+from math import (asin, atan2, cos, sin)
 import os.path
 import sqlite3
-from collections import defaultdict, namedtuple
+import typing
 
 from astropy.time import Time
-from scipy.interpolate import interp1d
 import numpy as np
+from scipy.interpolate import interp1d
 
+from .set_velocity_aberration import compute_va_effects_vector
 from ..assign_wcs.util import update_s_region_keyword, calc_rotation_matrix
 from ..assign_wcs.pointing import v23tosky
 from ..datamodels import Level1bModel
@@ -22,6 +29,38 @@ TYPES_TO_UPDATE = set(list(IMAGING_TYPES) + FGS_GUIDE_EXP_TYPES)
 # Setup logging
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+DEBUG_FULL = logging.DEBUG - 1
+LOGLEVELS = [logging.INFO, logging.DEBUG, DEBUG_FULL]
+
+
+# The available methods for transformation
+class Methods(Enum):
+    FULL         = ('full', 'calc_transforms_quaternion')                        # noqa: E221 JSOCINT-555 fix using quaternion
+    FULLVA       = ('fullva', 'calc_transforms_quaternion_velocity_abberation')  # noqa: E221 JSOCINT-555 fix using quaternion/VA
+    GSCMD_J3PAGS = ('gscmd', 'calc_transforms_gscmd_j3pags')                     # noqa: E221 JSOCINT-555 fix using J3PA@GS
+    GSCMD_V3PAGS = ('gscmd_v3pags', 'calc_transforms_gscmd_v3pags')              # noqa: E221 JSOCINT-555 fix using V3PA@GS
+    ORIGINAL     = ('original', 'calc_transforms_original')                      # noqa: E221 Original, pre-JSOCINT-555 algorithm
+
+    # Alias
+    default = FULL        # Use original algorithm if not specified
+    GSCMD = GSCMD_J3PAGS  # When specifying GS Commanded, use the J3VA@GS method by default.
+
+    def __new__(cls: object, value: str, func_name: str):
+        obj = object.__new__(cls)
+        obj._value_ = value
+        obj._func_name = func_name
+        return obj
+
+    @property
+    def func(self):
+        return globals()[self._func_name]
+
+    def __str__(self):
+        return self.value
+
+
+# Definition of th J3 Ideal Y-Angle
+J3IDLYANGLE = -1.25  # Degrees
 
 # Conversion from seconds to MJD
 SECONDS2MJD = 1 / 24 / 60 / 60
@@ -45,12 +84,32 @@ SIFOV2V_DEFAULT = np.array(
      [-0.00226892608, 0., 0.99999742598]]
 )
 
+MX2Z = np.array(
+    [[0, 1, 0],
+     [0, 0, 1],
+     [1, 0, 0]]
+)
+MZ2X = np.array(
+    [[0, 0, 1],
+     [1, 0, 0],
+     [0, 1, 0]]
+)
 
 # Degree, radian, angle transformations
 R2D = 180. / np.pi
 D2R = np.pi / 180.
 A2R = D2R / 3600.
 R2A = 3600. * R2D
+PI2 = np.pi * 2.
+
+# Map instrument three character mnemonic to full name
+INSTRUMENT_MAP = {
+    'fgs': 'fgs',
+    'mir': 'miri',
+    'nis': 'niriss',
+    'nrc': 'nircam',
+    'nrs': 'nirspec'
+}
 
 # SIAF container
 # The names should correspond to the names in the ``wcsinfo`` schema.
@@ -68,15 +127,20 @@ SIAF = namedtuple("SIAF", ["v2_ref", "v3_ref", "v3yangle", "vparity",
 SIAF.__new__.__defaults__ = (None, None, None, None, 0, 0, 3600, 3600,
                              (0, 1, 1, 0, 0, 0, 1, 1))
 
+SIAF_VERTICIES = ['XIdlVert1', 'XIdlVert2', 'XIdlVert3', 'XIdlVert4',
+                  'YIdlVert1', 'YIdlVert2', 'YIdlVert3', 'YIdlVert4']
+
 # Pointing container
-Pointing = namedtuple("Pointing", ["q", "j2fgs_matrix", "fsmcorr", "obstime"])
-Pointing.__new__.__defaults__ = (None, None, None, None)
+Pointing = namedtuple("Pointing", ["q", "j2fgs_matrix", "fsmcorr", "obstime", "gs_commanded"])
+Pointing.__new__.__defaults__ = ((None,) * 5)
 
 # Transforms
 Transforms = namedtuple("Transforms",
                         [
                             'm_eci2j',            # ECI to J-Frame
                             'm_j2fgs1',           # J-Frame to FGS1
+                            'm_eci2fgs1',         # ECI to FGS1
+                            'm_gs2gsapp',         # Velocity abberation
                             'm_sifov_fsm_delta',  # FSM correction
                             'm_fgs12sifov',       # FGS1 to SIFOV
                             'm_eci2sifov',        # ECI to SIFOV
@@ -85,11 +149,88 @@ Transforms = namedtuple("Transforms",
                             'm_v2siaf',           # V to SIAF
                             'm_eci2siaf'          # ECI to SIAF
                         ])
-Transforms.__new__.__defaults__ = (None, None, None, None, None,
-                                   None, None, None, None)
+Transforms.__new__.__defaults__ = ((None,) * 10)
+
 # WCS reference container
 WCSRef = namedtuple('WCSRef', ['ra', 'dec', 'pa'])
 WCSRef.__new__.__defaults__ = (None, None, None)
+
+
+@dataclass
+class TransformParameters:
+    """Parameters required the calculations
+
+    Parameters
+    ----------
+    allow_default : bool
+        If telemetry cannot be determined, use existing
+        information in the observation's header.
+
+    default_pa_v3 : float
+        The V3 position angle to use if the pointing information
+        is not found.
+
+    dry_run : bool
+        Do not write out the modified file.
+
+    engdb_url : str or None
+        URL of the engineering telemetry database REST interface.
+
+    fsmcorr_version : str
+        The version of the FSM correction calculation to use.
+        See :ref:`calc_sifov_fsm_delta_matrix`
+
+    fsmcorr_units : str
+        Units of the FSM correction values. Default is 'arcsec'.
+        See :ref:`calc_sifov_fsm_delta_matrix`
+
+    guide_star_wcs : WCSRef
+        Guide star WCS info, typically from the input model.
+
+    j2fgs_transpose : bool
+        Transpose the `j2fgs1` matrix.
+
+    jwst_velocity : numpy.array
+        The [DX, DY, DZ] barycentri velocity vector
+
+    method : `Methods`
+        The method, or algorithm, to use in calculating the transform.
+        If not specified, the default method is used.
+
+    reduce_func : func or None
+        Reduction function to use on values.
+
+    siaf : `SIAF`
+        The SIAF information for the input model
+
+    siaf_path : str or file-like object or None
+        The path to the SIAF database.
+
+    tolerance : int
+        If no telemetry can be found during the observation,
+        the time, in seconds, beyond the observation time to
+        search for telemetry.
+
+    useafter : str
+        The date of observation (``model.meta.date``)
+    """
+    allow_default: bool = False
+    default_pa_v3: float = 0.
+    dry_run: bool = False
+    engdb_url: str = None
+    fsmcorr_version: str = 'latest'
+    fsmcorr_units: str = 'arcsec'
+    guide_star_wcs: WCSRef = WCSRef()
+    j2fgs_transpose: bool = True
+    jwst_velocity: np.array = None
+    method: Methods = None
+    pointing: Pointing = None
+    reduce_func: typing.Callable = None
+    siaf: SIAF = None
+    siaf_path: str = None
+    tolerance: float = 60.
+    useafter: str = None
+    v3pa_at_gs: float = None
 
 
 def add_wcs(filename, default_pa_v3=0., siaf_path=None, engdb_url=None,
@@ -105,35 +246,35 @@ def add_wcs(filename, default_pa_v3=0., siaf_path=None, engdb_url=None,
 
     Parameters
     ----------
-    filename: str
+    filename : str
         The path to a data file.
 
-    default_pa_v3: float
+    default_pa_v3 : float
         The V3 position angle to use if the pointing information
         is not found.
 
-    siaf_path: str or file-like object or None
+    siaf_path : str or file-like object or None
         The path to the SIAF database.
 
-    engdb_url: str or None
+    engdb_url : str or None
         URL of the engineering telemetry database REST interface.
 
-    tolerance: int
+    tolerance : int
         If no telemetry can be found during the observation,
         the time, in seconds, beyond the observation time to
         search for telemetry.
 
-    allow_default: bool
+    allow_default : bool
         If telemetry cannot be determine, use existing
         information in the observation's header.
 
-    reduce_func: func or None
+    reduce_func : func or None
         Reduction function to use on values.
 
-    dry_run: bool
+    dry_run : bool
         Do not write out the modified file.
 
-    transform_kwargs: dict
+    transform_kwargs : dict
         Keyword arguments used by matrix calculation routines
 
     Notes
@@ -186,7 +327,7 @@ def add_wcs(filename, default_pa_v3=0., siaf_path=None, engdb_url=None,
     It does not currently place the new keywords in any particular location
     in the header other than what is required by the standard.
     """
-    logger.info('Updating WCS info for file {}'.format(filename))
+    logger.info('Updating WCS info for file %s', filename)
     with Level1bModel(filename) as model:
         update_wcs(
             model,
@@ -237,8 +378,8 @@ def update_mt_kwds(model):
             model.meta.target.ra = f_ra(exp_midpt_mjd).item(0)
             model.meta.target.dec = f_dec(exp_midpt_mjd).item(0)
         else:
-            logger.info('Exposure midpoint {} is not in the moving_target '
-                        'table range of {} to {}'.format(exp_midpt_mjd, time_mt[0], time_mt[-1]))
+            logger.info('Exposure midpoint %s is not in the moving_target '
+                        'table range of %s to %s', exp_midpt_mjd, time_mt[0], time_mt[-1])
             return
     else:
         logger.info("Moving target position table not found in the file")
@@ -275,22 +416,22 @@ def update_wcs(model, default_pa_v3=0., default_roll_ref=0., siaf_path=None, eng
     siaf_path : str
         The path to the SIAF file, i.e. ``XML_DATA`` env variable.
 
-    engdb_url: str or None
+    engdb_url : str or None
         URL of the engineering telemetry database REST interface.
 
-    tolerance: int
+    tolerance : int
         If no telemetry can be found during the observation,
         the time, in seconds, beyond the observation time to
         search for telemetry.
 
-    allow_default: bool
+    allow_default : bool
         If telemetry cannot be determine, use existing
         information in the observation's header.
 
-    reduce_func: func or None
+    reduce_func : func or None
         Reduction function to use on values.
 
-    transform_kwargs: dict
+    transform_kwargs : dict
         Keyword arguments used by matrix calculation routines.
     """
 
@@ -301,9 +442,9 @@ def update_wcs(model, default_pa_v3=0., default_roll_ref=0., siaf_path=None, eng
     except AttributeError:
         exp_type = None
     aperture_name = model.meta.aperture.name.upper()
+    useafter = model.meta.observation.date
     if aperture_name != "UNKNOWN":
-        logger.info("Updating WCS for aperture {}".format(aperture_name))
-        useafter = model.meta.observation.date
+        logger.info("Updating WCS for aperture %s", aperture_name)
         siaf = get_wcs_values_from_siaf(aperture_name, useafter, siaf_path)
         populate_model_from_siaf(model, siaf)
     else:
@@ -316,11 +457,13 @@ def update_wcs(model, default_pa_v3=0., default_roll_ref=0., siaf_path=None, eng
             model, default_roll_ref=default_roll_ref
         )
     else:
-        update_wcs_from_telem(
-            model, default_pa_v3=default_pa_v3, siaf=siaf, engdb_url=engdb_url,
+        t_pars = TransformParameters(
+            default_pa_v3=default_pa_v3, siaf=siaf, engdb_url=engdb_url,
             tolerance=tolerance, allow_default=allow_default,
-            reduce_func=reduce_func, **transform_kwargs
+            reduce_func=reduce_func, siaf_path=siaf_path, useafter=useafter,
+            **transform_kwargs
         )
+        update_wcs_from_telem(model, t_pars)
 
 
 def update_wcs_from_fgs_guiding(model, default_roll_ref=0.0, default_vparity=1, default_v3yangle=0.0):
@@ -340,7 +483,7 @@ def update_wcs_from_fgs_guiding(model, default_roll_ref=0.0, default_vparity=1, 
         If pointing information cannot be retrieved,
         use this as the V3 position angle.
 
-    default_vparity: int
+    default_vparity : int
         The default `VIdlParity` to use and should
         be either "1" or "-1". "1" is the
         default since FGS guiding will be using the
@@ -353,11 +496,7 @@ def update_wcs_from_fgs_guiding(model, default_roll_ref=0.0, default_vparity=1, 
     try:
         roll_ref = model.meta.wcsinfo.roll_ref if model.meta.wcsinfo.roll_ref is not None else default_roll_ref
     except AttributeError:
-        logger.warning(
-            'Keyword `ROLL_REF` not found. Using {} as default value'.format(
-                default_roll_ref
-            )
-        )
+        logger.warning('Keyword `ROLL_REF` not found. Using %s as default value', default_roll_ref)
         roll_ref = default_roll_ref
 
     roll_ref = np.deg2rad(roll_ref)
@@ -366,18 +505,13 @@ def update_wcs_from_fgs_guiding(model, default_roll_ref=0.0, default_vparity=1, 
     try:
         vparity = model.meta.wcsinfo.vparity
     except AttributeError:
-        logger.warning(
-            'Keyword "VPARITY" not found. Using {} as default value'.format(
-                default_vparity
-            )
-        )
+        logger.warning('Keyword "VPARITY" not found. Using %s as default value', default_vparity)
         vparity = default_vparity
 
     try:
         v3i_yang = model.meta.wcsinfo.v3yangle
     except AttributeError:
-        logger.warning(f'Keyword "V3I_YANG" not found. Using {default_v3yangle} as default value.')
-
+        logger.warning('Keyword "V3I_YANG" not found. Using %s as default value.', default_v3yangle)
         v3i_yang = default_v3yangle
 
     (
@@ -388,11 +522,7 @@ def update_wcs_from_fgs_guiding(model, default_roll_ref=0.0, default_vparity=1, 
     ) = calc_rotation_matrix(roll_ref, np.deg2rad(v3i_yang), vparity=vparity)
 
 
-def update_wcs_from_telem(
-    model, default_pa_v3=0., siaf=None, engdb_url=None,
-    tolerance=0, allow_default=False,
-    reduce_func=None, **transform_kwargs
-):
+def update_wcs_from_telem(model, t_pars: TransformParameters):
     """Update WCS pointing information
 
     Given a `jwst.datamodels.DataModel`, determine the simple WCS parameters
@@ -404,32 +534,11 @@ def update_wcs_from_telem(
     Parameters
     ----------
     model : `~jwst.datamodels.DataModel`
-        The model to update.
+        The model to update. The update is done in-place.
 
-    default_pa_v3 : float
-        If pointing information cannot be retrieved,
-        use this as the V3 position angle.
+    t_pars : `TransformParameters`
+        The transformation parameters. Parameters are updated during processing.
 
-    siaf_path : str
-        The path to the SIAF file, i.e. ``XML_DATA`` env variable.
-
-    engdb_url: str or None
-        URL of the engineering telemetry database REST interface.
-
-    tolerance: int
-        If no telemetry can be found during the observation,
-        the time, in seconds, beyond the observation time to
-        search for telemetry.
-
-    allow_default: bool
-        If telemetry cannot be determine, use existing
-        information in the observation's header.
-
-    reduce_func: func or None
-        Reduction function to use on values.
-
-    transform_kwargs: dict
-        Keyword arguments used by matrix calculation routines.
     """
 
     logger.info('Updating wcs from telemetry.')
@@ -437,7 +546,7 @@ def update_wcs_from_telem(
     # Get the SIAF and observation parameters
     obsstart = model.meta.exposure.start_time
     obsend = model.meta.exposure.end_time
-    if None in siaf:
+    if None in t_pars.siaf:
         # Check if any of "v2_ref", "v3_ref", "v3yangle", "vparity" is None
         # and raise an error. The other fields have default values.
         raise ValueError('Insufficient SIAF information found in header.')
@@ -446,46 +555,62 @@ def update_wcs_from_telem(
     wcsinfo = WCSRef(
         model.meta.target.ra,
         model.meta.target.dec,
-        default_pa_v3
+        t_pars.default_pa_v3
     )
     vinfo = wcsinfo
+    t_pars.guide_star_wcs = WCSRef(
+        model.meta.guidestar.gs_ra,
+        model.meta.guidestar.gs_dec,
+        model.meta.guidestar.gs_pa
+    )
+    logger.debug('guide_star_wcs from model: %s', t_pars.guide_star_wcs)
+
+    # Get jwst velocity
+    t_pars.jwst_velocity = np.array([
+        model.meta.ephemeris.velocity_x,
+        model.meta.ephemeris.velocity_y,
+        model.meta.ephemeris.velocity_z,
+    ])
+    logger.debug('JWST Velocity: %s', t_pars.jwst_velocity)
 
     # Get the pointing information
     try:
-        pointing = get_pointing(obsstart, obsend, engdb_url=engdb_url,
-                                tolerance=tolerance, reduce_func=reduce_func)
+        pointing = get_pointing(obsstart, obsend, engdb_url=t_pars.engdb_url,
+                                tolerance=t_pars.tolerance, reduce_func=t_pars.reduce_func)
     except ValueError as exception:
-        if not allow_default:
+        if not t_pars.allow_default:
             raise
         else:
             logger.warning(
                 'Cannot retrieve valid telescope pointing.'
                 ' Default pointing parameters will be used.'
-                '\nException is {}'.format(exception)
             )
+            logger.warning('Exception is %s', exception)
             logger.info("Setting ENGQLPTG keyword to PLANNED")
             model.meta.visit.pointing_engdb_quality = "PLANNED"
     else:
         # compute relevant WCS information
         logger.info('Successful read of engineering quaternions:')
-        logger.info('\tPointing = {}'.format(pointing))
-        model.meta.visit.pointing_engdb_quality = "CALCULATED"
+        logger.info('\tPointing: %s', pointing)
         try:
-            wcsinfo, vinfo = calc_wcs(pointing, siaf, **transform_kwargs)
-            logger.info("Setting ENGQLPTG keyword to CALCULATED")
+            t_pars.pointing = pointing
+            wcsinfo, vinfo = calc_wcs(t_pars)
+            pointing_engdb_quality = f'CALCULATED_{t_pars.method.value.upper()}'
+            logger.info('Setting ENGQLPTG keyword to %s', pointing_engdb_quality)
+            model.meta.visit.pointing_engdb_quality = pointing_engdb_quality
         except Exception as e:
             logger.warning(
                 'WCS calculation has failed and will be skipped.'
                 'Default pointing parameters will be used.'
-                '\nException is {}'.format(e)
             )
-            if not allow_default:
+            logger.warning('Exception is %s', e)
+            if not t_pars.allow_default:
                 raise
             else:
                 logger.info("Setting ENGQLPTG keyword to PLANNED")
                 model.meta.visit.pointing_engdb_quality = "PLANNED"
-    logger.info('Aperture WCS info: {}'.format(wcsinfo))
-    logger.info('V1 WCS info: {}'.format(vinfo))
+    logger.info('Aperture WCS info: %s', wcsinfo)
+    logger.info('V1 WCS info: %s', vinfo)
 
     # Update V1 pointing
     model.meta.pointing.ra_v1 = vinfo.ra
@@ -497,7 +622,7 @@ def update_wcs_from_telem(
     model.meta.wcsinfo.ra_ref = wcsinfo.ra
     model.meta.wcsinfo.dec_ref = wcsinfo.dec
     model.meta.wcsinfo.roll_ref = compute_local_roll(
-        vinfo.pa, wcsinfo.ra, wcsinfo.dec, siaf.v2_ref, siaf.v3_ref
+        vinfo.pa, wcsinfo.ra, wcsinfo.dec, t_pars.siaf.v2_ref, t_pars.siaf.v3_ref
     )
     if model.meta.exposure.type.lower() in TYPES_TO_UPDATE:
         model.meta.wcsinfo.crval1 = wcsinfo.ra
@@ -510,18 +635,16 @@ def update_wcs_from_telem(
         ) = calc_rotation_matrix(
             np.deg2rad(model.meta.wcsinfo.roll_ref),
             np.deg2rad(model.meta.wcsinfo.v3yangle),
-            vparity=siaf.vparity
+            vparity=t_pars.siaf.vparity
         )
 
     # Calculate S_REGION with the footprint
     # information
     try:
-        update_s_region(model, siaf)
+        update_s_region(model, t_pars.siaf)
     except Exception as e:
-        logger.warning(
-            'Calculation of S_REGION failed and will be skipped.'
-            '\nException is {}'.format(e)
-        )
+        logger.warning('Calculation of S_REGION failed and will be skipped.')
+        logger.warning('Exception is %s', e)
 
 
 def update_s_region(model, siaf):
@@ -540,9 +663,8 @@ def update_s_region(model, siaf):
     vertices = siaf.vertices_idl
     xvert = vertices[:4]
     yvert = vertices[4:]
-    logger.info(
-        "Vertices for aperture {0}: {1}".format(model.meta.aperture.name, vertices)
-    )
+    logger.info("Vertices for aperture %s: %s", model.meta.aperture.name, vertices)
+
     # Execute IdealToV2V3, followed by V23ToSky
     from ..transforms.models import IdealToV2V3
     vparity = model.meta.wcsinfo.vparity
@@ -602,6 +724,10 @@ def calc_wcs_over_time(obsstart, obsend, engdb_url=None, tolerance=60, reduce_fu
     obstimes = list()
     wcsinfos = list()
     vinfos = list()
+    t_pars = TransformParameters(
+        engdb_url=engdb_url, tolerance=tolerance, reduce_func=reduce_func, siaf=siaf,
+        **transform_kwargs
+    )
 
     # Calculate WCS
     try:
@@ -613,7 +739,8 @@ def calc_wcs_over_time(obsstart, obsend, engdb_url=None, tolerance=60, reduce_fu
     if not isinstance(pointings, list):
         pointings = [pointings]
     for pointing in pointings:
-        wcsinfo, vinfo = calc_wcs(pointing, siaf=siaf, **transform_kwargs)
+        t_pars.pointing = pointing
+        wcsinfo, vinfo = calc_wcs(t_pars)
         obstimes.append(pointing.obstime)
         wcsinfos.append(wcsinfo)
         vinfos.append(vinfo)
@@ -621,25 +748,18 @@ def calc_wcs_over_time(obsstart, obsend, engdb_url=None, tolerance=60, reduce_fu
     return obstimes, wcsinfos, vinfos
 
 
-def calc_wcs(pointing, siaf=None, **transform_kwargs):
+def calc_wcs(t_pars: TransformParameters):
     """Transform from the given SIAF information and Pointing
     the aperture and V1 wcs
 
     Parameters
     ----------
-    pointing : Pointing
-        The telescope pointing. See ref:`Notes` for further details
-
-    siaf : SIAF or None
-        The SIAF transformation. See ref:`Notes` for further details.
-        If `None`, unit transformation is used.
-
-    transform_kwargs : dict
-        Keyword arguments used by matrix calculation routines
+    t_pars : `TransformParameters`
+        The transformation parameters. Parameters are updated during processing.
 
     Returns
     -------
-    (wcsinfo, vinfo): (WCSRef, WCSRef)
+    (wcsinfo, vinfo) : (WCSRef, WCSRef)
         A 2-tuple is returned with the WCS pointing for
         the aperture and the V1 axis
 
@@ -668,11 +788,11 @@ def calc_wcs(pointing, siaf=None, **transform_kwargs):
     Parameter fsmcorr are two values provided as a list consisting of:
     [SA_ZADUCMDX, SA_ZADUCMDY]
     """
-    if siaf is None:
-        siaf = SIAF()
+    if t_pars.siaf is None:
+        t_pars.siaf = SIAF()
 
     # Calculate transforms
-    tforms = calc_transforms(pointing, siaf, **transform_kwargs)
+    tforms = calc_transforms(t_pars)
 
     # Calculate the V1 WCS information
     vinfo = calc_v1_wcs(tforms.m_eci2v)
@@ -684,8 +804,8 @@ def calc_wcs(pointing, siaf=None, **transform_kwargs):
     return (wcsinfo, vinfo)
 
 
-def calc_transforms(pointing, siaf, fsmcorr_version='latest', fsmcorr_units='arcsec', j2fgs_transpose=True):
-    """Calculate transforms from pointing to SIAF
+def calc_transforms(t_pars: TransformParameters):
+    """Calculate transforms  which determine reference point celestial WCS
 
     Given the spacecraft pointing parameters and the
     aperture-specific SIAF, calculate all the transforms
@@ -693,26 +813,34 @@ def calc_transforms(pointing, siaf, fsmcorr_version='latest', fsmcorr_units='arc
 
     Parameters
     ----------
-    pointing : Pointing
-        Observatory pointing information
-
-    siaf : SIAF
-        Aperture information
-
-    fsmcorr_version : str
-        The version of the FSM correction calculation to use.
-        See :ref:`calc_sifov_fsm_delta_matrix`
-
-    fsmcorr_units : str
-        Units of the FSM correction values. Default is 'arcsec'.
-        See :ref:`calc_sifov_fsm_delta_matrix`
-
-    j2fgs_transpose : bool
-        Transpose the `j2fgs1` matrix.
+    t_pars : TransformParameters
+        The transformation parameters. Parameters are updated during processing.
 
     Returns
     -------
-    transforms: Transforms
+    transforms : `Transforms`
+        The list of coordinate matrix transformations
+    """
+    t_pars.method = t_pars.method if t_pars.method else Methods.default
+    transforms = t_pars.method.func(t_pars)
+    return transforms
+
+
+def calc_transforms_quaternion(t_pars: TransformParameters):
+    """Calculate transforms which determine reference point celestial WCS from the original, pre-JSOCINT-555 algorithm
+
+    Given the spacecraft pointing parameters and the aperture-specific SIAF,
+    calculate all the transforms necessary to produce the celestial World
+    Coordinate system information.
+
+    Parameters
+    ----------
+    t_pars : TransformParameters
+        The transformation parameters. Parameters are updated during processing.
+
+    Returns
+    -------
+    transforms : Transforms
         The list of coordinate matrix transformations
 
     Notes
@@ -725,38 +853,37 @@ def calc_transforms(pointing, siaf, fsmcorr_version='latest', fsmcorr_units='arc
             M_v1_to_siaf      *   # V1 to SIAF
             M_sifov_to_v1     *   # Science Instruments Aperture to V1
             M_sifov_fsm_delta *   # Fine Steering Mirror correction
+            M_z_to_x          *   # Transposition
             M_fgs1_to_sifov   *   # FGS1 to Science Instruments Aperture
             M_j_to_fgs1       *   # J-Frame to FGS1
             M_eci_to_j        *   # ECI to J-Frame
+
     """
+    logger.info('Calculating transforms using FULL quaternion method...')
 
     # Determine the ECI to J-frame matrix
-    m_eci2j = calc_eci2j_matrix(pointing.q)
+    m_eci2j = calc_eci2j_matrix(t_pars.pointing.q)
+    logger.debug('m_eci2j: %s', m_eci2j)
 
-    # Calculate the J-frame to FGS! ICS matrix
-    m_j2fgs1 = calc_j2fgs1_matrix(pointing.j2fgs_matrix, transpose=j2fgs_transpose)
+    # Calculate the J-frame to FGS1 ICS matrix
+    m_j2fgs1 = calc_j2fgs1_matrix(t_pars.pointing.j2fgs_matrix, transpose=t_pars.j2fgs_transpose)
+    logger.debug('m_j2fgs1: %s', m_j2fgs1)
+    logger.debug('m_eci2fgs1: %s', np.dot(m_j2fgs1, m_eci2j))
 
     # Calculate the FSM corrections to the SI_FOV frame
     m_sifov_fsm_delta = calc_sifov_fsm_delta_matrix(
-        pointing.fsmcorr, fsmcorr_version=fsmcorr_version, fsmcorr_units=fsmcorr_units
+        t_pars.pointing.fsmcorr, fsmcorr_version=t_pars.fsmcorr_version, fsmcorr_units=t_pars.fsmcorr_units
     )
 
     # Calculate the FGS1 ICS to SI-FOV matrix
-    m_fgs12sifov = calc_fgs1_to_sifov_mastrix()
+    m_fgs12sifov = calc_fgs1_to_sifov_matrix()
 
     # Calculate SI FOV to V1 matrix
     m_sifov2v = calc_sifov2v_matrix()
 
     # Calculate ECI to SI FOV
-    m_eci2sifov = np.dot(
-        m_sifov_fsm_delta,
-        np.dot(
-            m_fgs12sifov,
-            np.dot(
-                m_j2fgs1,
-                m_eci2j
-            )
-        )
+    m_eci2sifov = np.linalg.multi_dot(
+        [MZ2X, m_sifov_fsm_delta, m_fgs12sifov, m_j2fgs1, m_eci2j]
     )
 
     # Calculate the complete transform to the V1 reference
@@ -766,7 +893,7 @@ def calc_transforms(pointing, siaf, fsmcorr_version='latest', fsmcorr_units='arc
     )
 
     # Calculate the SIAF transform matrix
-    m_v2siaf = calc_v2siaf_matrix(siaf)
+    m_v2siaf = calc_v2siaf_matrix(t_pars.siaf)
 
     # Calculate the full ECI to SIAF transform matrix
     m_eci2siaf = np.dot(
@@ -781,17 +908,568 @@ def calc_transforms(pointing, siaf, fsmcorr_version='latest', fsmcorr_units='arc
     return tforms
 
 
+def calc_transforms_quaternion_velocity_abberation(t_pars: TransformParameters):
+    """Calculate transforms which determine reference point celestial WCS from the original, pre-JSOCINT-555 algorithm
+
+    Given the spacecraft pointing parameters and the aperture-specific SIAF,
+    calculate all the transforms necessary to produce the celestial World
+    Coordinate system information.
+
+    Parameters
+    ----------
+    t_pars : TransformParameters
+        The transformation parameters. Parameters are updated during processing.
+
+    Returns
+    -------
+    transforms : Transforms
+        The list of coordinate matrix transformations
+
+    Notes
+    -----
+    The matrix transform pipeline to convert from ECI J2000 observatory
+    qauternion pointing to aperture ra/dec/roll information
+    is given by the following formula. Each term is a 3x3 matrix:
+
+        M_eci_to_siaf =           # The complete transformation
+            M_v1_to_siaf      *   # V1 to SIAF
+            M_sifov_to_v1     *   # Science Instruments Aperture to V1
+            M_sifov_fsm_delta *   # Fine Steering Mirror correction
+            M_z_to_x          *   # Transposition
+            M_fgs1_to_sifov   *   # FGS1 to Science Instruments Aperture
+            M_gs2gsapp        *   # Apply Velocity Aberration
+            M_j_to_fgs1       *   # J-Frame to FGS1
+            M_eci_to_j        *   # ECI to J-Frame
+
+    """
+    logger.info('Calculating transforms using FULLVA quaternion method with velocity aberration...')
+
+    # Determine the ECI to J-frame matrix
+    m_eci2j = calc_eci2j_matrix(t_pars.pointing.q)
+    logger.debug('m_eci2j: %s', m_eci2j)
+
+    # Calculate the J-frame to FGS1 ICS matrix
+    m_j2fgs1 = calc_j2fgs1_matrix(t_pars.pointing.j2fgs_matrix, transpose=t_pars.j2fgs_transpose)
+    logger.debug('m_j2fgs1: %s', m_j2fgs1)
+
+    m_eci2fgs1 = np.dot(m_j2fgs1, m_eci2j)
+    logger.debug('m_eci2fgs1: %s', m_eci2fgs1)
+
+    # Calculate Velocity Aberration corrections
+    m_gs2gsapp = calc_gs2gsapp(m_eci2fgs1, t_pars.jwst_velocity)
+    logger.debug('m_gs2gsapp: %s', m_gs2gsapp)
+
+    # Calculate the FSM corrections to the SI_FOV frame
+    m_sifov_fsm_delta = calc_sifov_fsm_delta_matrix(
+        t_pars.pointing.fsmcorr, fsmcorr_version=t_pars.fsmcorr_version, fsmcorr_units=t_pars.fsmcorr_units
+    )
+
+    # Calculate the FGS1 ICS to SI-FOV matrix
+    m_fgs12sifov = calc_fgs1_to_sifov_matrix()
+
+    # Calculate SI FOV to V1 matrix
+    m_sifov2v = calc_sifov2v_matrix()
+
+    # Calculate ECI to SI FOV
+    m_eci2sifov = np.linalg.multi_dot(
+        [MZ2X, m_sifov_fsm_delta, m_fgs12sifov, m_gs2gsapp, m_j2fgs1, m_eci2j]
+    )
+
+    # Calculate the complete transform to the V1 reference
+    m_eci2v = np.dot(
+        m_sifov2v,
+        m_eci2sifov
+    )
+
+    # Calculate the SIAF transform matrix
+    m_v2siaf = calc_v2siaf_matrix(t_pars.siaf)
+
+    # Calculate the full ECI to SIAF transform matrix
+    m_eci2siaf = np.dot(
+        m_v2siaf,
+        m_eci2v
+    )
+
+    tforms = Transforms(m_eci2j=m_eci2j, m_j2fgs1=m_j2fgs1, m_eci2fgs1=m_eci2fgs1,
+                        m_gs2gsapp=m_gs2gsapp, m_sifov_fsm_delta=m_sifov_fsm_delta,
+                        m_fgs12sifov=m_fgs12sifov, m_eci2sifov=m_eci2sifov, m_sifov2v=m_sifov2v,
+                        m_eci2v=m_eci2v, m_v2siaf=m_v2siaf, m_eci2siaf=m_eci2siaf
+                        )
+    return tforms
+
+
+def calc_transforms_original(t_pars: TransformParameters):
+    """Calculate transforms which determine reference point celestial WCS from the original, pre-JSOCINT-555 algorithm
+
+    Given the spacecraft pointing parameters and the aperture-specific SIAF,
+    calculate all the transforms necessary to produce the celestial World
+    Coordinate system information.
+
+    Parameters
+    ----------
+    t_pars : TransformParameters
+        The transformation parameters. Parameters are updated during processing.
+
+    Returns
+    -------
+    transforms : Transforms
+        The list of coordinate matrix transformations
+
+    Notes
+    -----
+    The matrix transform pipeline to convert from ECI J2000 observatory
+    qauternion pointing to aperture ra/dec/roll information
+    is given by the following formula. Each term is a 3x3 matrix:
+
+        M_eci_to_siaf =           # The complete transformation
+            M_v1_to_siaf      *   # V1 to SIAF
+            M_sifov_to_v1     *   # Science Instruments Aperture to V1
+            M_sifov_fsm_delta *   # Fine Steering Mirror correction
+            M_z_to_x          *   # Transposition
+            M_fgs1_to_sifov   *   # FGS1 to Science Instruments Aperture
+            M_j_to_fgs1       *   # J-Frame to FGS1
+            M_eci_to_j        *   # ECI to J-Frame
+
+    """
+    logger.info('Calculating transforms using ORIGINAL method...')
+
+    # Determine the ECI to J-frame matrix
+    m_eci2j = calc_eci2j_matrix(t_pars.pointing.q)
+    logger.debug('m_eci2j: %s', m_eci2j)
+
+    # Calculate the J-frame to FGS1 ICS matrix
+    m_j2fgs1 = calc_j2fgs1_matrix(t_pars.pointing.j2fgs_matrix, transpose=t_pars.j2fgs_transpose)
+    logger.debug('m_j2fgs1: %s', m_j2fgs1)
+    logger.debug('m_eci2fgs1: %s', np.dot(m_j2fgs1, m_eci2j))
+
+    # Calculate the FSM corrections to the SI_FOV frame
+    m_sifov_fsm_delta = calc_sifov_fsm_delta_matrix(
+        t_pars.pointing.fsmcorr, fsmcorr_version=t_pars.fsmcorr_version, fsmcorr_units=t_pars.fsmcorr_units
+    )
+
+    # Calculate the FGS1 ICS to SI-FOV matrix
+    m_fgs12sifov = calc_fgs1_to_sifov_matrix()
+
+    # Calculate SI FOV to V1 matrix
+    m_sifov2v = calc_sifov2v_matrix()
+
+    # Calculate ECI to SI FOV
+    m_eci2sifov = np.linalg.multi_dot(
+        [m_sifov_fsm_delta, MZ2X, m_fgs12sifov, m_j2fgs1, m_eci2j]
+    )
+
+    # Calculate the complete transform to the V1 reference
+    m_eci2v = np.dot(
+        m_sifov2v,
+        m_eci2sifov
+    )
+
+    # Calculate the SIAF transform matrix
+    m_v2siaf = calc_v2siaf_matrix(t_pars.siaf)
+
+    # Calculate the full ECI to SIAF transform matrix
+    m_eci2siaf = np.dot(
+        m_v2siaf,
+        m_eci2v
+    )
+
+    tforms = Transforms(m_eci2j=m_eci2j, m_j2fgs1=m_j2fgs1, m_sifov_fsm_delta=m_sifov_fsm_delta,
+                        m_fgs12sifov=m_fgs12sifov, m_eci2sifov=m_eci2sifov, m_sifov2v=m_sifov2v,
+                        m_eci2v=m_eci2v, m_v2siaf=m_v2siaf, m_eci2siaf=m_eci2siaf
+                        )
+    return tforms
+
+
+def calc_transforms_gscmd_j3pags(t_pars: TransformParameters):
+    """Calculate transforms which determine reference point celestial WCS using the JSOCINT-555 fix and J3PA@GS
+
+    Given the spacecraft pointing parameters and the
+    aperture-specific SIAF, calculate all the transforms
+    necessary to produce WCS information. This is using a modified
+    algorithm to fix a documentation error and to override a shift
+    being introduced by the OTB simulator.
+
+    Parameters
+    ----------
+    t_pars : TransformParameters
+        The transformation parameters. Parameters are updated during processing.
+
+    Returns
+    -------
+    transforms : Transforms
+        The list of coordinate matrix transformations
+
+    Notes
+    -----
+    This algorithm is in response to an apparent misbehavior of the OTB simulator.
+    See JSOCINT-555 for full details. The workaround is to ignore the quaternion
+    and FGS1 J-frame telemetry. Instead use the commanded guide star telemetry.
+
+    The matrix transform pipeline to convert from ECI J2000 observatory
+    qauternion pointing to aperture ra/dec/roll information
+    is given by the following formula. Each term is a 3x3 matrix:
+
+        M_eci_to_siaf =                    # The complete transformation
+            M_v1_to_siaf               *   # V1 to SIAF
+            M_sifov_to_v1              *   # Science Instruments Aperture to V1
+            M_z_to_x                   *   # Transposition
+            M_sifov_fsm_delta          *   # Fine Steering Mirror correction
+            M_fgs1_to_sifov_fgs1siaf   *   # FGS1 to Science Instruments Aperture
+            M_eci_to_fgs1                  # ECI to FGS1 using commanded information
+    """
+    logger.info('Calculating transforms using GSCMD with J3PA@GS method...')
+
+    # Determine the ECI to FGS1 ICS using guide star telemetry.
+    m_eci2fgs1 = calc_eci2fgs1_j3pags(t_pars)
+
+    # Calculate the FGS1 ICS to SI-FOV matrix
+    m_fgs12sifov = calc_fgs1_to_sifov_fgs1siaf_matrix(siaf_path=t_pars.siaf_path, useafter=t_pars.useafter)
+
+    # Calculate the FSM corrections to the SI_FOV frame
+    m_sifov_fsm_delta = calc_sifov_fsm_delta_matrix(
+        t_pars.pointing.fsmcorr, fsmcorr_version=t_pars.fsmcorr_version, fsmcorr_units=t_pars.fsmcorr_units
+    )
+
+    # Calculate SI FOV to V1 matrix
+    m_sifov2v = calc_sifov2v_matrix()
+
+    # Calculate ECI to SI FOV
+    m_eci2sifov = np.linalg.multi_dot(
+        [MZ2X, m_sifov_fsm_delta, m_fgs12sifov, m_eci2fgs1]
+    )
+    logger.debug('m_eci2sifov: %s', m_eci2sifov)
+
+    # Calculate the complete transform to the V1 reference
+    m_eci2v = np.dot(m_sifov2v, m_eci2sifov)
+    logger.debug('m_eci2v: %s', m_eci2v)
+
+    # Calculate the SIAF transform matrix
+    m_v2siaf = calc_v2siaf_matrix(t_pars.siaf)
+
+    # Calculate the full ECI to SIAF transform matrix
+    m_eci2siaf = np.dot(m_v2siaf, m_eci2v)
+    logger.debug('m_eci2siaf: %s', m_eci2siaf)
+
+    tforms = Transforms(m_eci2fgs1=m_eci2fgs1, m_eci2j=None, m_sifov_fsm_delta=m_sifov_fsm_delta,
+                        m_fgs12sifov=m_fgs12sifov, m_eci2sifov=m_eci2sifov, m_sifov2v=m_sifov2v,
+                        m_eci2v=m_eci2v, m_v2siaf=m_v2siaf, m_eci2siaf=m_eci2siaf
+                        )
+    return tforms
+
+
+def calc_transforms_gscmd_v3pags(t_pars: TransformParameters):
+    """Calculate transforms which determine reference point celestial WCS using the JSOCINT-555 fix
+
+    Given the spacecraft pointing parameters and the
+    aperture-specific SIAF, calculate all the transforms
+    necessary to produce WCS information. This is using a modified
+    algorithm to fix a documentation error and to override a shift
+    being introduced by the OTB simulator.
+
+    Parameters
+    ----------
+    t_pars : TransformParameters
+        The transformation parameters. Parameters are updated during processing.
+
+    Returns
+    -------
+    transforms : Transforms
+        The list of coordinate matrix transformations
+
+    Notes
+    -----
+    This algorithm is in response to an apparent misbehavior of the OTB simulator.
+    See JSOCINT-555 for full details. The workaround is to ignore the quaternion
+    and FGS1 J-frame telemetry. Instead use the commanded guide star telemetry.
+
+    The matrix transform pipeline to convert from ECI J2000 observatory
+    quaternion pointing to aperture ra/dec/roll information
+    is given by the following formula. Each term is a 3x3 matrix:
+
+        M_eci_to_siaf =                    # The complete transformation
+            M_v1_to_siaf               *   # V1 to SIAF
+            M_sifov_to_v1              *   # Science Instruments Aperture to V1
+            M_z_to_x                   *   # Transposition
+            M_sifov_fsm_delta          *   # Fine Steering Mirror correction
+            M_fgs1_to_sifov_fgs1siaf   *   # FGS1 to Science Instruments Aperture
+            M_eci_to_fgs1                  # ECI to FGS1 using commanded information
+    """
+    logger.info('Calculating transforms using GSCMD using V3PA@GS method...')
+
+    # Determine the ECI to FGS1 ICS using guide star telemetry.
+    m_eci2fgs1 = calc_eci2fgs1_v3pags(t_pars)
+
+    # Calculate the FSM corrections to the SI_FOV frame
+    m_sifov_fsm_delta = calc_sifov_fsm_delta_matrix(
+        t_pars.pointing.fsmcorr, fsmcorr_version=t_pars.fsmcorr_version, fsmcorr_units=t_pars.fsmcorr_units
+    )
+
+    # Calculate the FGS1 ICS to SI-FOV matrix
+    m_fgs12sifov = calc_fgs1_to_sifov_fgs1siaf_matrix(siaf_path=t_pars.siaf_path, useafter=t_pars.useafter)
+
+    # Calculate SI FOV to V1 matrix
+    m_sifov2v = calc_sifov2v_matrix()
+
+    # Calculate ECI to SI FOV
+    m_eci2sifov = np.linalg.multi_dot(
+        [MZ2X, m_sifov_fsm_delta, m_fgs12sifov, m_eci2fgs1]
+    )
+
+    # Calculate the complete transform to the V1 reference
+    m_eci2v = np.dot(m_sifov2v, m_eci2sifov)
+
+    # Calculate the SIAF transform matrix
+    m_v2siaf = calc_v2siaf_matrix(t_pars.siaf)
+
+    # Calculate the full ECI to SIAF transform matrix
+    m_eci2siaf = np.dot(m_v2siaf, m_eci2v)
+
+    tforms = Transforms(m_eci2fgs1=m_eci2fgs1, m_sifov_fsm_delta=m_sifov_fsm_delta,
+                        m_fgs12sifov=m_fgs12sifov, m_eci2sifov=m_eci2sifov, m_sifov2v=m_sifov2v,
+                        m_eci2v=m_eci2v, m_v2siaf=m_v2siaf, m_eci2siaf=m_eci2siaf,
+                        m_eci2j=None,
+                        )
+    return tforms
+
+
+def calc_eci2fgs1_j3pags(t_pars: TransformParameters):
+    """Calculate full ECI to FGS1 matrix based on commanded guidestar information and J3PA@GS
+
+    Parameters
+    ----------
+    t_pars : TransformParameters
+        The transformation parameters
+
+    Return
+    ------
+    m_eci2fgs1 : numpy.array
+        The ECI to FGS1ics matrix
+
+    Modifies
+    --------
+    t_pars.guide_star_wcs
+        Update PA to calculated if originally None.
+    """
+    # Calculate J3 position.
+    m_eci2j = calc_eci2j_matrix(t_pars.pointing.q)
+    j3_ra, j3_dec = vector_to_ra_dec(m_eci2j[2])
+    j3wcs = WCSRef(j3_ra, j3_dec, None)
+    logger.debug('j3wcs: %s', j3wcs)
+
+    # Calculate J3PA@GS
+    logger.debug('Incoming guide_star_wcs: %s', t_pars.guide_star_wcs)
+    if not t_pars.guide_star_wcs.pa:
+        gs_wcs_ra = WCSRef(t_pars.guide_star_wcs.ra * D2R,
+                           t_pars.guide_star_wcs.dec * D2R, None)
+        pa = calc_position_angle(gs_wcs_ra, j3wcs)
+        pa *= R2D
+        t_pars.guide_star_wcs = WCSRef(t_pars.guide_star_wcs.ra, t_pars.guide_star_wcs.dec, pa)
+
+    logger.debug('guide_star_wcs: %s', t_pars.guide_star_wcs)
+    logger.debug('gs_commanded: %s', t_pars.pointing.gs_commanded)
+
+    m_gs_commanded = calc_m_gs_commanded(t_pars.guide_star_wcs, J3IDLYANGLE, t_pars.pointing.gs_commanded)
+
+    # Need to invert the martrix
+    m_gs_commanded = np.linalg.inv(m_gs_commanded)
+
+    logger.debug('m_gs_commanded: %s', m_gs_commanded)
+
+    m_eci2fgs1 = np.dot(MX2Z, m_gs_commanded)
+    logger.debug('m_eci2fgs1: %s', m_eci2fgs1)
+
+    return m_eci2fgs1
+
+
+def calc_gs2gsapp(m_eci2fgs1, jwst_velocity):
+    """Calculate the Velocity Aberration correction
+
+    Parameters
+    ----------
+    m_eci2fgs : numpy.array(3, 3)
+        The matrix defining the FGS1, guide star, position
+
+    jwst_velocity : numpy.array([dx, dy, dz])
+        The barycentric velocity of JWST
+
+    Returns
+    -------
+    m_gs2gsapp : numpy.array(3, 3)
+        The corection matrix
+
+    Notes
+    -----
+    The algorithm is from an NGAS memo describing the procedure. The steps referred
+    to in the commentary are in direct relation to the memo's text.
+
+    Step 1 is the calculation of the Meci2fgs1 matrix, which is the input.
+    """
+    ux = np.array([1., 0., 0.])
+
+    # Step 2: Compute guide star unit vector
+    u = np.dot(np.transpose(m_eci2fgs1), ux)
+
+    # Step 3: Apply VA
+    try:
+        scale_factor, u_j2000 = compute_va_effects_vector(*jwst_velocity, u)
+    except TypeError:
+        logger.warning('Failure in computing velocity aberration. Returning identity matrix.')
+        logger.warning('Exception: %s', sys.exc_info()[0])
+        return np.identity(3)
+
+    # Step 4: Transform to guide star attitude frame
+    u_gs = np.dot(m_eci2fgs1, u_j2000)
+
+    # Step 5: Compute apparent attitude correction
+    u_prod = np.cross(ux, u_gs)
+    a_hat = u_prod / np.linalg.norm(u_prod)
+    a_hat_sym = np.array([[0., -a_hat[2], a_hat[1]],
+                          [a_hat[2], 0., -a_hat[0]],
+                          [-a_hat[1], a_hat[0], 0.]])
+    theta = np.arccos(np.dot(ux, u_gs) / np.linalg.norm(u_gs))
+
+    m_gs2gsapp = np.identity(3) - a_hat_sym * np.sin(theta) + 2 * a_hat_sym**2 * np.sin(theta / 2.)**2
+
+    return m_gs2gsapp
+
+
+def calc_eci2fgs1_v3pags(t_pars: TransformParameters):
+    """Calculate full ECI to FGS1 matrix based on commanded guidestar information andd V3PA@GS
+
+    Parameters
+    ----------
+    t_pars : TransformParameters
+        The transformation parameters. Parameters are updated during processing.
+    """
+    fgs1_siaf = get_wcs_values_from_siaf('FGS1_FULL_OSS', useafter=t_pars.useafter, prd_db_filepath=t_pars.siaf_path)
+    logger.debug('fgs1_siaf: %s', fgs1_siaf)
+
+    logger.debug('Incoming guide_star_wcs: %s', t_pars.guide_star_wcs)
+    if not t_pars.guide_star_wcs.pa:
+        pa = calc_v3pa_at_gs_from_original(t_pars)
+        t_pars.guide_star_wcs = WCSRef(t_pars.guide_star_wcs.ra, t_pars.guide_star_wcs.dec, pa)
+
+    logger.debug('guide_star_wcs: %s', t_pars.guide_star_wcs)
+    logger.debug('gs_commanded: %s', t_pars.pointing.gs_commanded)
+
+    m_gs_commanded = calc_m_gs_commanded(t_pars.guide_star_wcs, fgs1_siaf.v3yangle, t_pars.pointing.gs_commanded)
+
+    # Need to invert the martrix
+    m_gs_commanded = np.linalg.inv(m_gs_commanded)
+
+    logger.debug('m_gs_commanded: %s', m_gs_commanded)
+
+    m_eci2fgs1 = np.dot(MX2Z, m_gs_commanded)
+    logger.debug('m_eci2fgs1: %s', m_eci2fgs1)
+
+    return m_eci2fgs1
+
+
+def calc_m_gs_commanded(guide_star_wcs, yangle, gs_commanded):
+    """Calculate the guide star matrix
+
+    Parameters
+    ----------
+    guide_star_wcs : WCSRef
+        The guide star position
+
+    yangle : float
+        The IdlYangle of the point in question.
+
+    gs_commanded : numpy.array(2)
+        The commanded position from telemetry
+
+    Returns
+    -------
+    m_gs_commanded : np.array(3,3)
+        The transformation matrix
+    """
+
+    # Define the individal rotations
+    def r1(a):
+        r = np.array([
+            [1, 0, 0],
+            [0, cos(a), -sin(a)],
+            [0, sin(a), cos(a)]
+        ])
+        return r
+
+    def r2(a):
+        r = np.array([
+            [cos(a), 0, sin(a)],
+            [0, 1, 0],
+            [-sin(a), 0, cos(a)]
+        ])
+        return r
+
+    def r3(a):
+        r = np.array([
+            [cos(a), -sin(a), 0],
+            [sin(a), cos(a), 0],
+            [0, 0, 1]
+        ])
+        return r
+
+    # Convert to radians
+    ra = guide_star_wcs.ra * D2R
+    dec = guide_star_wcs.dec * D2R
+    pa = guide_star_wcs.pa * D2R
+    yangle_ra = yangle * D2R
+    gs_commanded_rads = gs_commanded * A2R
+
+    # Calculate
+    m = np.linalg.multi_dot([r3(ra), r2(-dec), r1(-(pa + yangle_ra)), r2(gs_commanded_rads[1]), r3(-gs_commanded_rads[0])])
+    return m
+
+
+def calc_v3pa_at_gs_from_original(t_pars: TransformParameters) -> float:
+    """Calculate V3PA@GS by precomputing V1 using original method
+
+    Parameters
+    ----------
+    t_pars : TransformParameters
+        The transformation parameters. Parameters are updated during processing.
+
+    Returns
+    -------
+    v3pa_at_gs : float
+    """
+
+    # Calculate V1 using ORIGINAL method
+    tforms = calc_transforms_original(t_pars)
+    vinfo = calc_v1_wcs(tforms.m_eci2v)
+    logger.debug('vinfo: %s', vinfo)
+
+    # Convert to radians
+    ra_v1 = vinfo.ra * D2R
+    dec_v1 = vinfo.dec * D2R
+    pa_v3 = vinfo.pa * D2R
+    ra_gs = t_pars.guide_star_wcs.ra * D2R
+    dec_gs = t_pars.guide_star_wcs.dec * D2R
+
+    # Calculate
+    x = -sin(ra_v1) * sin(pa_v3) - cos(ra_v1) * sin(dec_v1) * cos(pa_v3)
+    y = cos(ra_v1) * sin(pa_v3) - sin(ra_v1) * sin(dec_v1) * cos(pa_v3)
+
+    ra_v3 = atan2(y, x)
+    dec_v3 = asin(cos(dec_v1) * cos(pa_v3))
+
+    v3pa_at_gs = calc_position_angle(WCSRef(ra_gs, dec_gs, None), WCSRef(ra_v3, dec_v3, None))
+    v3pa_at_gs *= R2D
+    return v3pa_at_gs
+
+
 def calc_v1_wcs(m_eci2v):
     """Calculate the V1 wcs information
 
     Parameters
     ----------
-    m_eci2v: np.array((3, 3))
+    m_eci2v : np.array((3, 3))
         The ECI to V transformation matrix
 
     Returns
     -------
-    vinfo: WCSRef
+    vinfo : WCSRef
         The V1 wcs pointing
     """
     # V1 RA/Dec is the first row of the transform
@@ -820,12 +1498,12 @@ def calc_aperture_wcs(m_eci2siaf):
 
     Parameters
     ----------
-    m_eci2siaf: np.array((3, 3))
+    m_eci2siaf : np.array((3, 3))
         The ECI to SIAF transformation matrix
 
     Returns
     -------
-    wcsinfo: WCSRef
+    wcsinfo : WCSRef
         The aperturn wcs information
     """
 
@@ -856,6 +1534,8 @@ def calc_aperture_wcs(m_eci2siaf):
     x = sin(vy_dec) * cos(wcs_dec) - \
         cos(vy_dec) * sin(wcs_dec) * cos((vy_ra - wcs_ra))
     wcs_pa = np.arctan2(y, x)
+    if wcs_pa < 0.:
+        wcs_pa += PI2
 
     # Convert all WCS to degrees
     wcsinfo = WCSRef(
@@ -872,12 +1552,12 @@ def calc_eci2j_matrix(q):
 
     Parameters
     ----------
-    q: np.array(q1, q2, q3, q4)
+    q : np.array(q1, q2, q3, q4)
         Array of quaternions from the engineering database
 
     Returns
     -------
-    transform: np.array((3, 3))
+    transform : np.array((3, 3))
         The transform matrix representing the transformation
         from observatory orientation to J-Frame
     """
@@ -902,23 +1582,21 @@ def calc_j2fgs1_matrix(j2fgs_matrix, transpose=False):
 
     Parameters
     ----------
-    j2fgs_matrix: n.array((9,))
+    j2fgs_matrix : n.array((9,))
         Matrix parameters from the engineering database.
         If all zeros, a predefined matrix is used.
 
-    transpose: bool
+    transpose : bool
         Transpose the resulting matrix.
 
     Returns
     -------
-    transform: np.array((3, 3))
+    transform : np.array((3, 3))
         The transformation matrix
     """
     if np.isclose(j2fgs_matrix, 0.).all():
-        logger.warning(
-            'J-Frame to FGS1 engineering parameters are all zero.'
-            '\nUsing default matrix'
-        )
+        logger.warning('J-Frame to FGS1 engineering parameters are all zero.')
+        logger.warning('Using default matrix')
         m_partial = np.asarray(
             [
                 [0., 1., 0.],
@@ -965,13 +1643,13 @@ def calc_sifov_fsm_delta_matrix(fsmcorr, fsmcorr_version='latest', fsmcorr_units
 
     Returns
     -------
-    transform: np.array((3, 3))
+    transform : np.array((3, 3))
         The transformation matrix
     """
     version = fsmcorr_version.lower()
     units = fsmcorr_units.lower()
-    logger.debug('Using version {}'.format(version))
-    logger.debug('Using units {}'.format(units))
+    logger.debug('Using version %s', version)
+    logger.debug('Using units %s', units)
 
     x = fsmcorr[0]  # SA_ZADUCMDX
     y = fsmcorr[1]  # SA_ZADUCMDY
@@ -996,8 +1674,7 @@ def calc_sifov_fsm_delta_matrix(fsmcorr, fsmcorr_version='latest', fsmcorr_units
     else:
         if version not in ('latest', 'v2'):
             logger.warning(
-                'Unknown version "{}" specified.'
-                ' Using the latest (spherical) calculation.'
+                'Unknown version "%s" specified. Using the latest (spherical) calculation.', version
             )
         m_x_partial = np.array(
             [
@@ -1015,23 +1692,45 @@ def calc_sifov_fsm_delta_matrix(fsmcorr, fsmcorr_version='latest', fsmcorr_units
         )
         transform = np.dot(m_x_partial, m_y_partial)
 
+    logger.debug('transform: %s', transform)
     return transform
 
 
-def calc_fgs1_to_sifov_mastrix():
+def calc_fgs1_to_sifov_matrix():
     """
-    Calculate the FGS! to SI-FOV matrix
+    Calculate the FGS1 to SI-FOV matrix
 
     Currently, this is a defined matrix
     """
-    m_partial = np.array(
-        [[0, 0, 1],
-         [1, 0, 0],
-         [0, 1, 0]]
-    )
+    logger.debug('M_fgs1_to_sifov: %s', FGS12SIFOV_DEFAULT)
+    return FGS12SIFOV_DEFAULT
 
-    transform = np.dot(m_partial, FGS12SIFOV_DEFAULT)
-    return transform
+
+def calc_fgs1_to_sifov_fgs1siaf_matrix(siaf_path=None, useafter=None):
+    """
+    Calculate the FGS1 to SI-FOV matrix
+
+    Based on algorithm determined in JSOCINT-555 for a more
+    accurate determination of the matrix using the SIAF
+    """
+    try:
+        fgs1_siaf = get_wcs_values_from_siaf('FGS1_FULL_OSS', useafter, siaf_path)
+    except (KeyError, OSError, TypeError, RuntimeError):
+        logger.warning('Cannot read a SIAF database. Using the default FGS1_to_SIFOV matrix')
+        return calc_fgs1_to_sifov_matrix()
+
+    v2 = fgs1_siaf.v2_ref * A2R
+    v3 = (fgs1_siaf.v3_ref + 7.8 * 60.0) * A2R
+    y = fgs1_siaf.v3yangle * D2R
+
+    m = np.array([
+        [cos(v2) * cos(y) + sin(v2) * sin(v3) * sin(y), cos(v2) * sin(y) - sin(v2) * sin(v3) * cos(y), sin(v2) * cos(v3)],
+        [-cos(v3) * sin(y), cos(v3) * cos(y), sin(v3)],
+        [-sin(v2) * cos(y) + cos(v2) * sin(v3) * sin(y), -sin(v2) * sin(y) - cos(v2) * sin(v3) * cos(y), cos(v2) * cos(v3)]
+    ])
+    logger.debug('FGS1_to_SIFOV from siaf is %s', m)
+
+    return m
 
 
 def calc_sifov2v_matrix():
@@ -1049,12 +1748,12 @@ def calc_v2siaf_matrix(siaf):
 
     Parameters
     ----------
-    siaf: SIAF
+    siaf : SIAF
         The SIAF parameters
 
     Returns
     -------
-    transform: np.array((3, 3))
+    transform : np.array((3, 3))
         The V1 to SIAF transformation matrix
     """
     v2, v3, v3idlyang, vparity = (siaf.v2_ref, siaf.v3_ref,
@@ -1078,31 +1777,37 @@ def calc_v2siaf_matrix(siaf):
                      [1., 0., 0.]])
 
     transform = np.dot(pmat, mat)
+    logger.debug('transform: %s', transform)
+
     return transform
 
 
-def calc_position_angle(v1, v3):
-    """Calculate V3 position angle @V1
+def calc_position_angle(target, point):
+    """Calculate point position angle @target
 
     Parameters
     ----------
-    v1: WCSRef
-        The V1 wcs parameters
+    target : WCSRef
+        The TARGET wcs parameters
 
-    v3: WCSRef
-        The V3 wcs parameters
+    point : WCSRef
+        The POINT wcs parameters
 
     Returns
     -------
-    v3_pa: float
-      The V3 position angle, in radians
+    point_pa : float
+      The POINT position angle, in radians
     """
-    y = cos(v3.dec) * sin(v3.ra - v1.ra)
-    x = sin(v3.dec) * cos(v1.dec) - \
-        cos(v3.dec) * sin(v1.dec) * cos((v3.ra - v1.ra))
-    v3_pa = np.arctan2(y, x)
+    y = cos(point.dec) * sin(point.ra - target.ra)
+    x = sin(point.dec) * cos(target.dec) - \
+        cos(point.dec) * sin(target.dec) * cos((point.ra - target.ra))
+    point_pa = np.arctan2(y, x)
+    if point_pa < 0:
+        point_pa += PI2
+    if point_pa >= PI2:
+        point_pa -= PI2
 
-    return v3_pa
+    return point_pa
 
 
 def get_pointing(obsstart, obsend, engdb_url=None,
@@ -1112,24 +1817,24 @@ def get_pointing(obsstart, obsend, engdb_url=None,
 
     Parameters
     ----------
-    obsstart, obsend: float
+    obsstart, obsend : float
         MJD observation start/end times
 
-    engdb_url: str or None
+    engdb_url : str or None
         URL of the engineering telemetry database REST interface.
 
-    tolerance: int
+    tolerance : int
         If no telemetry can be found during the observation,
         the time, in seconds, beyond the observation time to
         search for telemetry.
 
-    reduce_func: func or None
+    reduce_func : func or None
         Reduction function to use on values.
         If None, the average pointing is returned.
 
     Returns
     -------
-    pointing: Pointing or [Pointing(, ...)]
+    pointing : Pointing or [Pointing(, ...)]
         The engineering pointing parameters.
         If the `result_type` is `all`, a list
         of pointings will be returned
@@ -1148,21 +1853,18 @@ def get_pointing(obsstart, obsend, engdb_url=None,
     if reduce_func is None:
         reduce_func = pointing_from_average
 
-    logger.info(
-        'Determining pointing between observations times (mjd):'
-        'obsstart = {obsstart} obsend = {obsend}'
-        '\nTelemetry search tolerance = {tolerance}'
-        '\nReduction function = {reduce_func}'
-        ''.format(
-            obsstart=obsstart, obsend=obsend, tolerance=tolerance, reduce_func=reduce_func
-        )
-    )
+    logger.info('Determining pointing between observations times (mjd):')
+    logger.info('obsstart: %s obsend: %s', obsstart, obsend)
+    logger.info('Telemetry search tolerance: %s', tolerance)
+    logger.info('Reduction function: %s', reduce_func)
 
     mnemonics = get_mnemonics(obsstart, obsend, tolerance, engdb_url=engdb_url)
     reduced = reduce_func(mnemonics)
 
-    logger.debug(f'Memonics found:\n{mnemonics}')
-    logger.info(f'Reduced set of pointings:\n{reduced}')
+    logger.log(DEBUG_FULL, 'Memonics found:')
+    logger.log(DEBUG_FULL, '%s', mnemonics)
+    logger.info('Reduced set of pointings:')
+    logger.info('%s', reduced)
 
     return reduced
 
@@ -1172,11 +1874,11 @@ def vector_to_ra_dec(v):
 
     Parameters
     ----------
-    v: [v0, v1, v2]
+    v : [v0, v1, v2]
 
     Returns
     -------
-    ra, dec: float, float
+    ra, dec : float, float
         The spherical angles, in radians
     """
     ra = np.arctan2(v[1], v[0])
@@ -1184,6 +1886,26 @@ def vector_to_ra_dec(v):
     if ra < 0.:
         ra += 2. * np.pi
     return(ra, dec)
+
+
+def ra_dec_to_vector(ra, dec):
+    """Convert spherical angles to unit vector
+
+    Parameters
+    ----------
+    ra, dec : float
+        Spherical angles in radians
+
+    Returns
+    -------
+    v : [float, float, float]
+        Unit vector
+    """
+    v0 = sin(ra) * cos(dec)
+    v1 = sin(ra) * sin(dec)
+    v2 = cos(dec)
+
+    return [v0, v1, v2]
 
 
 def compute_local_roll(pa_v3, ra_ref, dec_ref, v2_ref, v3_ref):
@@ -1237,7 +1959,7 @@ def _roll_angle_from_matrix(matrix, v2, v3):
     return new_roll
 
 
-def get_wcs_values_from_siaf(aperture_name, useafter, prd_db_filepath=None):
+def get_wcs_values_from_siaf(aperture_name, useafter=None, prd_db_filepath=None):
     """
     Query the SIAF database file and get WCS values.
 
@@ -1251,7 +1973,87 @@ def get_wcs_values_from_siaf(aperture_name, useafter, prd_db_filepath=None):
     Parameters
     ----------
     aperture_name : str
-        The name of the aperture in the data file (``model.meta.aperture.name``).
+        The name of the aperture to retrieve.
+        List of values can be specified as comma-separated values within the string.
+        For example: 'FGS1_FULL_OSS, FGS1_FULL'
+    useafter : str or None
+        The date of observation (``model.meta.date``).
+        If None, use current date
+    prd_db_filepath : str
+        The path to the SIAF (PRD database) file.
+        If None, attempt to get the path from the ``XML_DATA`` environment variable.
+        If no PRD is available, use the `pysiaf` interface to retrieve the necessary information
+
+    Returns
+    -------
+    siaf : namedtuple
+        The SIAF namedtuple with values from the PRD database.
+    """
+    if not useafter:
+        useafter = date.today().strftime('%Y-%m-%d')
+
+    try:
+        siaf = get_wcs_values_from_siaf_prd(aperture_name, useafter, prd_db_filepath=prd_db_filepath)
+    except (KeyError, OSError, TypeError, RuntimeError):
+        siaf = get_wcs_values_from_siaf_api(aperture_name)
+
+    logger.info('For aperture %s: SIAF: %s', aperture_name, siaf)
+    return siaf
+
+
+def get_wcs_values_from_siaf_api(aperture_name):
+    """
+    Query the SIAF database through pysiaf and get WCS values.
+
+    Given an ``APERTURE_NAME`` query the SIAF database
+    and extract the following keywords:
+    ``V2Ref``, ``V3Ref``, ``V3IdlYAngle``, ``VIdlParity``,
+    ``XSciRef``, ``YSciRef``, ``XSciScale``, ``YSciScale``,
+    ``XIdlVert1``, ``XIdlVert2``, ``XIdlVert3``, ``XIdlVert4``,
+    ``YIdlVert1``, ``YIdlVert2``, ``YIdlVert3``, ``YIdlVert4``
+
+    Parameters
+    ----------
+    aperture_name : str
+        The name of the aperture to retrieve.
+
+    Returns
+    -------
+    siaf : namedtuple
+        The SIAF namedtuple with values from the PRD database.
+    """
+    logger.info('Retrieving WCS through SIAF API `pysiaf`')
+    import pysiaf
+
+    # Retrieve SIAF
+    instrument = INSTRUMENT_MAP[aperture_name[:3].lower()]
+    siaf = pysiaf.Siaf(instrument)
+    aperture = siaf[aperture_name.upper()]
+
+    # Fill out the Siaf
+    verticies = tuple(getattr(aperture, key) for key in SIAF_VERTICIES)
+    siaf = SIAF(v2_ref=aperture.V2Ref, v3_ref=aperture.V3Ref, v3yangle=aperture.V3IdlYAngle, vparity=aperture.VIdlParity,
+                crpix1=aperture.XSciRef, crpix2=aperture.YSciRef, cdelt1=aperture.XSciScale, cdelt2=aperture.YSciScale,
+                vertices_idl=verticies)
+
+    return siaf
+
+
+def get_wcs_values_from_siaf_prd(aperture_name, useafter, prd_db_filepath=None):
+    """
+    Query the SIAF database file and get WCS values.
+
+    Given an ``APERTURE_NAME`` and a ``USEAFTER`` date query the SIAF database
+    and extract the following keywords:
+    ``V2Ref``, ``V3Ref``, ``V3IdlYAngle``, ``VIdlParity``,
+    ``XSciRef``, ``YSciRef``, ``XSciScale``, ``YSciScale``,
+    ``XIdlVert1``, ``XIdlVert2``, ``XIdlVert3``, ``XIdlVert4``,
+    ``YIdlVert1``, ``YIdlVert2``, ``YIdlVert3``, ``YIdlVert4``
+
+    Parameters
+    ----------
+    aperture_name : str
+        The name of the aperture to retrieve.
     useafter : str
         The date of observation (``model.meta.date``)
     prd_db_filepath : str
@@ -1275,10 +2077,9 @@ def get_wcs_values_from_siaf(aperture_name, useafter, prd_db_filepath=None):
         logger.info(message)
         raise OSError(message)
     prd_db_filepath = "file:{0}?mode=ro".format(prd_db_filepath)
-    logger.info("Using SIAF database from {}".format(prd_db_filepath))
+    logger.info("Using SIAF database from %s", prd_db_filepath)
     logger.info("Quering SIAF for aperture "
-                "{0} with USEAFTER {1}".format(aperture_name, useafter))
-    aperture = (aperture_name, useafter)
+                "%s with USEAFTER %s", aperture_name, useafter)
 
     RESULT = {}
     PRD_DB = False
@@ -1290,8 +2091,9 @@ def get_wcs_values_from_siaf(aperture_name, useafter, prd_db_filepath=None):
                        "XSciRef, YSciRef, XSciScale, YSciScale, "
                        "XIdlVert1, XIdlVert2, XIdlVert3, XIdlVert4, "
                        "YIdlVert1, YIdlVert2, YIdlVert3, YIdlVert4 "
-                       "FROM Aperture WHERE Apername = ? and UseAfterDate <= ? ORDER BY UseAfterDate LIMIT 1",
-                       aperture)
+                       "FROM Aperture WHERE Apername = ? "
+                       "and UseAfterDate <= ? ORDER BY UseAfterDate LIMIT 1",
+                       (aperture_name, useafter))
         for row in cursor:
             RESULT[row[0]] = tuple(row[1:17])
         PRD_DB.commit()
@@ -1301,7 +2103,7 @@ def get_wcs_values_from_siaf(aperture_name, useafter, prd_db_filepath=None):
     finally:
         if PRD_DB:
             PRD_DB.close()
-    logger.info("loaded {0} table rows from {1}".format(len(RESULT), prd_db_filepath))
+    logger.info("loaded %s table rows from %s", len(RESULT), prd_db_filepath)
     default_siaf = SIAF()
     if RESULT:
         # This populates the SIAF tuple with the values from the database.
@@ -1319,7 +2121,7 @@ def get_wcs_values_from_siaf(aperture_name, useafter, prd_db_filepath=None):
         siaf = SIAF(*values)
         return siaf
     else:
-        return default_siaf
+        raise RuntimeError(f'No SIAF entries found for {aperture_name}')
 
 
 def get_mnemonics(obsstart, obsend, tolerance, engdb_url=None):
@@ -1327,20 +2129,20 @@ def get_mnemonics(obsstart, obsend, tolerance, engdb_url=None):
 
     Parameters
     ----------
-    obsstart, obsend: float
+    obsstart, obsend : float
         MJD observation start/end times
 
-    tolerance: int
+    tolerance : int
         If no telemetry can be found during the observation,
         the time, in seconds, beyond the observation time to
         search for telemetry.
 
-    engdb_url: str or None
+    engdb_url : str or None
         URL of the engineering telemetry database REST interface.
 
     Returns
     -------
-    mnemonics: {mnemonic: [value[,...]][,...]}
+    mnemonics : {mnemonic: [value[,...]][,...]}
         The values for each pointing mnemonic
 
     Raises
@@ -1354,12 +2156,10 @@ def get_mnemonics(obsstart, obsend, tolerance, engdb_url=None):
     except Exception as exception:
         raise ValueError(
             'Cannot open engineering DB connection'
-            '\nException: {}'.format(
-                exception
-            )
+            '\nException: {}'.format(exception)
         )
     logger.info(
-        'Querying engineering DB: {}'.format(engdb.base_url)
+        'Querying engineering DB: %s', engdb.base_url
     )
 
     mnemonics = {
@@ -1376,8 +2176,10 @@ def get_mnemonics(obsstart, obsend, tolerance, engdb_url=None):
         'SA_ZRFGS2J31': None,
         'SA_ZRFGS2J32': None,
         'SA_ZRFGS2J33': None,
-        'SA_ZADUCMDX': None,
-        'SA_ZADUCMDY': None,
+        'SA_ZADUCMDX':  None,
+        'SA_ZADUCMDY':  None,
+        'SA_ZFGGSCMDX':  None,
+        'SA_ZFGGSCMDY':  None,
     }
 
     # Retrieve the mnemonics from the engineering database.
@@ -1404,12 +2206,9 @@ def get_mnemonics(obsstart, obsend, tolerance, engdb_url=None):
         if len(mnemonics[mnemonic]) > 2:
             mnemonics[mnemonic] = mnemonics[mnemonic][1:-1]
         else:
-            logger.warning(
-                'Mnemonic {} has no telemetry within the observation time.'
-                '\nAttempting to use bracket values within {} seconds'.format(
-                    mnemonic, tolerance
-                )
-            )
+            logger.warning('Mnemonic %s has no telemetry within the observation time.', mnemonic)
+            logger.warning('Attempting to use bracket values within %s seconds', tolerance)
+
             tolerance_mjd = tolerance * SECONDS2MJD
             allowed_start = obsstart - tolerance_mjd
             allowed_end = obsend + tolerance_mjd
@@ -1440,12 +2239,12 @@ def all_pointings(mnemonics):
 
     Parameters
     ==========
-    mnemonics: {mnemonic: [value[,...]][,...]}
+    mnemonics : {mnemonic: [value[,...]][,...]}
         The values for each pointing mnemonic
 
     Returns
     =======
-    pointings: [Pointing[,...]]
+    pointings : [Pointing[,...]]
         List of pointings.
     """
     pointings = []
@@ -1477,8 +2276,15 @@ def all_pointings(mnemonics):
             mnemonics_at_time['SA_ZADUCMDY'].value,
 
         ])
+
+        gs_commanded = np.array([
+            mnemonics_at_time['SA_ZFGGSCMDX'].value,
+            mnemonics_at_time['SA_ZFGGSCMDY'].value
+
+        ])
+
         pointing = Pointing(q=q, obstime=obstime, j2fgs_matrix=j2fgs_matrix,
-                            fsmcorr=fsmcorr)
+                            fsmcorr=fsmcorr, gs_commanded=gs_commanded)
         pointings.append(pointing)
 
     if not len(pointings):
@@ -1527,8 +2333,8 @@ def populate_model_from_siaf(model, siaf):
     # normally return False, but we want to treat it as TSO anyway.
     if is_tso(model) or model.meta.exposure.type.lower() in ['nrc_tsimage', 'nrc_tsgrism']:
         logger.info('TSO exposure:')
-        logger.info(' setting xref_sci to {}'.format(siaf.crpix1))
-        logger.info(' setting yref_sci to {}'.format(siaf.crpix2))
+        logger.info(' setting xref_sci to %s', siaf.crpix1)
+        logger.info(' setting yref_sci to %s', siaf.crpix2)
         model.meta.wcsinfo.siaf_xref_sci = siaf.crpix1
         model.meta.wcsinfo.siaf_yref_sci = siaf.crpix2
 
@@ -1538,12 +2344,12 @@ def first_pointing(mnemonics):
 
     Parameters
     ==========
-    mnemonics: {mnemonic: [value[,...]][,...]}
+    mnemonics : {mnemonic: [value[,...]][,...]}
         The values for each pointing mnemonic
 
     Returns
     =======
-    pointing: Pointing
+    pointing : Pointing
         First pointing.
 
     """
@@ -1556,12 +2362,12 @@ def pointing_from_average(mnemonics):
 
     Parameters
     ==========
-    mnemonics: {mnemonic: [value[,...]][,...]}
+    mnemonics : {mnemonic: [value[,...]][,...]}
         The values for each pointing mnemonic
 
     Returns
     =======
-    pointing: Pointing
+    pointing : Pointing
         Pointing from average.
 
     """
@@ -1586,9 +2392,8 @@ def pointing_from_average(mnemonics):
             eng_param.value
             for eng_param in mnemonics[mnemonic]
         ]
-        # Weed out mnemonic entries that are zero
-        # 'SA_ZADUCMDX' and 'SA_ZADUCMDY' can be zero
-        if mnemonic not in ['SA_ZADUCMDX', 'SA_ZADUCMDY']:
+        # Weed out mnemonic entries that are zero, though some are OK to be zero.
+        if mnemonic not in ['SA_ZADUCMDX', 'SA_ZADUCMDY', 'SA_ZFGGSCMDX', 'SA_ZFGGSCMDY']:
             good_mnemonic = []
             for this_value in values:
                 if this_value != 0.0:
@@ -1605,6 +2410,7 @@ def pointing_from_average(mnemonics):
         badmnemonicsstring = ' '.join(zero_mnemonics)
         logger.info(badmnemonicsstring)
         raise ValueError("Bad telemetry values")
+
     # Fill out the pointing matrices.
     q = np.array([
         mnemonic_averages['SA_ZATTEST1'],
@@ -1630,8 +2436,15 @@ def pointing_from_average(mnemonics):
         mnemonic_averages['SA_ZADUCMDY']
 
     ])
+
+    gs_commanded = np.array([
+        mnemonic_averages['SA_ZFGGSCMDX'],
+        mnemonic_averages['SA_ZFGGSCMDY']
+
+    ])
+
     pointing = Pointing(obstime=obstime, q=q, j2fgs_matrix=j2fgs_matrix,
-                        fsmcorr=fsmcorr)
+                        fsmcorr=fsmcorr, gs_commanded=gs_commanded)
     # That's all folks
     return pointing
 
