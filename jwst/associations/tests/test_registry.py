@@ -23,15 +23,6 @@ def test_registry_match(full_pool_rules):
     assert len(asns) >= 1
 
 
-def test_import_from_file():
-    current_path = deepcopy(sys.path)
-    with NamedTemporaryFile() as junk_fh:
-        junk_path = junk_fh.name
-        with pytest.raises(ImportError):
-            import_from_file(junk_path)
-        assert current_path == sys.path
-
-
 # Tests below for keyvalue_registry
 
 def test_dict_like():

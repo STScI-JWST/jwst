@@ -29,8 +29,8 @@
 """
 Utilities
 """
-from copy import copy
 from importlib import import_module
+import importlib.util
 import inspect
 import logging
 import os
@@ -96,8 +96,6 @@ def load_local_pkg(fpath):
     """
     package_fpath, package = os.path.split(fpath)
     package_fpath_len = len(package_fpath) + 1
-    sys_path = copy(sys.path)
-    sys.path.insert(0, package_fpath)
     try:
         for module_fpath in folder_traverse(
             fpath, basename_regex=r'[^_].+\.py$', path_exclude_regex='tests'
@@ -107,15 +105,16 @@ def load_local_pkg(fpath):
             module_path.append(os.path.splitext(fname)[0])
             module_path = '.'.join(module_path)
             try:
-                module = import_module(module_path)
+                spec = importlib.util.spec_from_file_location(module_path,module_fpath)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
             except Exception as err:
                 logger.debug(f'Cannot load module "{module_path}": {str(err)}')
             else:
                 yield module
     except Exception as err:
         logger.debug(f'Cannot complete package loading: Exception occurred: "{str(err)}"')
-    finally:
-        sys.path = sys_path
 
 
 def folder_traverse(folder_path, basename_regex='.+', path_exclude_regex='^$'):
