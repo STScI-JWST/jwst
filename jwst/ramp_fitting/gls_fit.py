@@ -10,6 +10,7 @@
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
+'''
 import logging
 from multiprocessing.pool import Pool as Pool
 import numpy as np
@@ -1180,3 +1181,4 @@ def gls_fit(ramp_data,
     fitparam_uncs = fitparam_cov.diagonal(axis1=1, axis2=2).copy()
 
     return (fitparam2d, fitparam_uncs)
+'''

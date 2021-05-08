@@ -154,6 +154,8 @@ ramp_fitting
 
 - Refactoring ramp fit code separating OLS and GLS code into their own file. [#5951]
 
+- Refactoring ramp fit code in preparation for moving code to STCAL. [#6010]
+
 refpix
 ------
 

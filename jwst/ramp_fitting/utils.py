@@ -6,9 +6,7 @@ import multiprocessing
 import numpy as np
 import warnings
 
-from .. import datamodels
-from ..datamodels import dqflags
-from ..lib import reffile_utils
+from ..datamodels import dqflags  # TODO here for flags
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
@@ -16,6 +14,7 @@ log.setLevel(logging.DEBUG)
 # Replace zero or negative variances with this:
 LARGE_VARIANCE = 1.e8
 
+# TODO Change dependencies when moved to STCAL
 DO_NOT_USE = dqflags.group['DO_NOT_USE']
 JUMP_DET = dqflags.group['JUMP_DET']
 SATURATED = dqflags.group['SATURATED']
@@ -272,15 +271,13 @@ class OptRes:
 
         Parameters
         ----------
-        model : instance of Data Model
-            DM object for input
-
         effintim : float
             effective integration time for a single group
 
         Returns
         -------
-        rfo_model : Data Model object
+        opt_info: tuple
+            The tuple of computed optional results arrays for fitting.
         """
         self.var_p_seg[self.var_p_seg > 0.4 * LARGE_VARIANCE] = 0.
         self.var_r_seg[self.var_r_seg > 0.4 * LARGE_VARIANCE] = 0.
@@ -292,19 +289,20 @@ class OptRes:
         self.weights[1. / self.weights > 0.4 * LARGE_VARIANCE] = 0.
         warnings.resetwarnings()
 
-        rfo_model = \
-            datamodels.RampFitOutputModel(
-                slope=self.slope_seg.astype(np.float32) / effintim,
-                sigslope=self.sigslope_seg.astype(np.float32),
-                var_poisson=self.var_p_seg.astype(np.float32),
-                var_rnoise=self.var_r_seg.astype(np.float32),
-                yint=self.yint_seg.astype(np.float32),
-                sigyint=self.sigyint_seg.astype(np.float32),
-                pedestal=self.ped_int.astype(np.float32),
-                weights=self.weights.astype(np.float32),
-                crmag=self.cr_mag_seg)
+        slope = self.slope_seg.astype(np.float32) / effintim
+        sigslope = self.sigslope_seg.astype(np.float32)
+        var_poisson = self.var_p_seg.astype(np.float32)
+        var_rnoise = self.var_r_seg.astype(np.float32)
+        yint = self.yint_seg.astype(np.float32)
+        sigyint = self.sigyint_seg.astype(np.float32)
+        pedestal = self.ped_int.astype(np.float32)
+        weights = self.weights.astype(np.float32)
+        crmag = self.cr_mag_seg
 
-        return rfo_model
+        opt_info = (slope, sigslope, var_poisson, var_rnoise,
+                    yint, sigyint, pedestal, weights, crmag)
+
+        return opt_info
 
     def print_full(self):  # pragma: no cover
         """
@@ -707,7 +705,8 @@ def output_integ(slope_int, dq_int, effintim, var_p3, var_r3, var_both3,
 
     Returns
     -------
-    cubemod : Data Model object
+    integ_info: tuple
+        The tuple of computed integration:t fitting arrays.
 
     """
     # Suppress harmless arithmetic warnings for now
@@ -718,20 +717,22 @@ def output_integ(slope_int, dq_int, effintim, var_p3, var_r3, var_both3,
     var_r3[var_r3 > 0.4 * LARGE_VARIANCE] = 0.
     var_both3[var_both3 > 0.4 * LARGE_VARIANCE] = 0.
 
-    cubemod = datamodels.CubeModel()
-    cubemod.data = slope_int / effintim
-    cubemod.err = np.sqrt(var_both3)
-    cubemod.dq = dq_int
-    cubemod.var_poisson = var_p3
-    cubemod.var_rnoise = var_r3
-    cubemod.int_times = int_times
+    data = slope_int / effintim
+    err = np.sqrt(var_both3)
+    dq = dq_int
+    var_poisson = var_p3
+    var_rnoise = var_r3
+    int_times = int_times
+    integ_info = (data, dq, var_poisson, var_rnoise, int_times, err)
 
     # Reset the warnings filter to its original state
     warnings.resetwarnings()
 
-    return cubemod
+    return integ_info
 
 
+'''
+# BEGIN remove GLS
 def gls_output_integ(model, slope_int, slope_err_int, dq_int):
     """
     For the GLS algorithm, construct the output integration-specific results.
@@ -869,6 +870,8 @@ def gls_pedestal(first_group, slope_int, s_mask,
         pedestal[s_mask] = 0.
 
     return pedestal
+# END remove GLS
+'''
 
 
 def shift_z(a, off):
@@ -1112,54 +1115,6 @@ def reset_bad_gain(pdq, gain):
     return pdq
 
 
-def get_ref_subs(model, readnoise_model, gain_model, nframes):
-    """
-    Get readnoise array for calculation of variance of noiseless ramps, and
-    the gain array in case optimal weighting is to be done. The returned
-    readnoise has been multiplied by the gain.
-
-    Parameters
-    ----------
-    model : data model
-        input data model, assumed to be of type RampModel
-
-    readnoise_model : instance of data Model
-        readnoise for all pixels
-
-    gain_model : instance of gain Model
-        gain for all pixels
-
-    nframes : int
-        number of frames averaged per group; from the NFRAMES keyword. Does
-        not contain the groupgap.
-
-    Returns
-    -------
-    readnoise_2d : float, 2D array
-        readnoise subarray
-
-    gain_2d : float, 2D array
-        gain subarray
-    """
-    if reffile_utils.ref_matches_sci(model, gain_model):
-        gain_2d = gain_model.data
-    else:
-        log.info('Extracting gain subarray to match science data')
-        gain_2d = reffile_utils.get_subarray_data(model, gain_model)
-
-    if reffile_utils.ref_matches_sci(model, readnoise_model):
-        readnoise_2d = readnoise_model.data.copy()
-    else:
-        log.info('Extracting readnoise subarray to match science data')
-        readnoise_2d = reffile_utils.get_subarray_data(model, readnoise_model)
-
-    # convert read noise to correct units & scale down for single groups,
-    #   and account for the number of frames per group
-    readnoise_2d *= gain_2d / np.sqrt(2. * nframes)
-
-    return readnoise_2d, gain_2d
-
-
 def remove_bad_singles(segs_beg_3):
     """
     For the current integration and data section, remove all segments having only
@@ -1304,27 +1259,26 @@ def do_all_sat(pixeldq, groupdq, imshape, n_int, save_opt):
 
     Returns
     -------
-    new_model : Data Model object
-        DM object containing a rate image averaged over all integrations in
-        the exposure
+    image_info: tuple
+        The tuple of computed ramp fitting arrays.
 
-    int_model : Data Model object or None
-        DM object containing rate images for each integration in the exposure
+    integ_info: tuple
+        The tuple of computed integration fitting arrays.
 
-    opt_model : RampFitOutputModel object or None
-        DM object containing optional OLS-specific ramp fitting data for the
-        exposure
+    opt_info: tuple
+        The tuple of computed optional results arrays for fitting.
     """
     # Create model for the primary output. Flag all pixels in the pixiel DQ
     #   extension as SATURATED and DO_NOT_USE.
     pixeldq = np.bitwise_or(pixeldq, dqflags.group['SATURATED'])
     pixeldq = np.bitwise_or(pixeldq, dqflags.group['DO_NOT_USE'])
 
-    new_model = datamodels.ImageModel(data=np.zeros(imshape, dtype=np.float32),
-                                      dq=pixeldq,
-                                      var_poisson=np.zeros(imshape, dtype=np.float32),
-                                      var_rnoise=np.zeros(imshape, dtype=np.float32),
-                                      err=np.zeros(imshape, dtype=np.float32))
+    data = np.zeros(imshape, dtype=np.float32)
+    dq = pixeldq
+    var_poisson = np.zeros(imshape, dtype=np.float32)
+    var_rnoise = np.zeros(imshape, dtype=np.float32)
+    err = np.zeros(imshape, dtype=np.float32)
+    image_info = (data, dq, var_poisson, var_rnoise, err)
 
     # Create model for the integration-specific output. The 3D group DQ created
     #   is based on the 4D group DQ of the model, and all pixels in all
@@ -1339,38 +1293,41 @@ def do_all_sat(pixeldq, groupdq, imshape, n_int, save_opt):
                                                         axis=0)
 
         groupdq_3d = np.bitwise_or(groupdq_3d, dqflags.group['DO_NOT_USE'])
-        int_model = datamodels.CubeModel(
-            data=np.zeros((n_int,) + imshape, dtype=np.float32),
-            dq=groupdq_3d,
-            var_poisson=np.zeros((n_int,) + imshape, dtype=np.float32),
-            var_rnoise=np.zeros((n_int,) + imshape, dtype=np.float32),
-            int_times=None,
-            err=np.zeros((n_int,) + imshape, dtype=np.float32))
 
+        data = np.zeros((n_int,) + imshape, dtype=np.float32)
+        dq = groupdq_3d
+        var_poisson = np.zeros((n_int,) + imshape, dtype=np.float32)
+        var_rnoise = np.zeros((n_int,) + imshape, dtype=np.float32)
+        int_times = None
+        err = np.zeros((n_int,) + imshape, dtype=np.float32)
+
+        integ_info = (data, dq, var_poisson, var_rnoise, int_times, err)
     else:
-        int_model = None
+        integ_info = None
 
     # Create model for the optional output
     if save_opt:
         new_arr = np.zeros((n_int,) + (1,) + imshape, dtype=np.float32)
 
-        opt_model = datamodels.RampFitOutputModel(
-            slope=new_arr,
-            sigslope=new_arr,
-            var_poisson=new_arr,
-            var_rnoise=new_arr,
-            yint=new_arr,
-            sigyint=new_arr,
-            pedestal=np.zeros((n_int,) + imshape, dtype=np.float32),
-            weights=new_arr,
-            crmag=new_arr)
+        slope = new_arr
+        sigslope = new_arr
+        var_poisson = new_arr
+        var_rnoise = new_arr
+        yint = new_arr
+        sigyint = new_arr
+        pedestal = np.zeros((n_int,) + imshape, dtype=np.float32)
+        weights = new_arr
+        crmag = new_arr
+
+        opt_info = (slope, sigslope, var_poisson, var_rnoise,
+                    yint, sigyint, pedestal, weights, crmag)
 
     else:
-        opt_model = None
+        opt_info = None
 
     log.info('All groups of all integrations are saturated.')
 
-    return new_model, int_model, opt_model
+    return image_info, integ_info, opt_info
 
 
 def log_stats(c_rates):
