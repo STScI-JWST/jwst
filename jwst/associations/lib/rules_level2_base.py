@@ -438,9 +438,18 @@ class DMSLevel2bBase(DMSBaseMixin, Association):
 
                 for other_science in science_exps:
                     if other_science['expname'] != science_exp['expname']:
-                        now_background = Member(other_science)
-                        now_background['exptype'] = 'background'
-                        new_members.append(now_background)
+                        if science_exp.item['exp_type'] == 'nrs_fixedslit':
+                            try:
+                                if other_science.item['spat_num'] != science_exp.item['spat_num']:
+                                    now_background = Member(other_science)
+                                    now_background['exptype'] = 'background'
+                                    new_members.append(now_background)
+                            except KeyError:
+                                pass
+                        else:
+                            now_background = Member(other_science)
+                            now_background['exptype'] = 'background'
+                            new_members.append(now_background)
 
                 new_members += nonscience_exps
 
