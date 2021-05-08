@@ -54,6 +54,7 @@ from .tso_photometry.tso_photometry_step import TSOPhotometryStep
 from .tweakreg.tweakreg_step import TweakRegStep
 from .wavecorr.wavecorr_step import WavecorrStep
 from .wfs_combine.wfs_combine_step import WfsCombineStep
+from .wfss_contam.wfss_contam_step import WfssContamStep
 from .white_light.white_light_step import WhiteLightStep
 
 
@@ -114,5 +115,6 @@ __all__ = [
     "TweakRegStep",
     "WavecorrStep",
     "WfsCombineStep",
+    "WfssContamStep",
     "WhiteLightStep",
 ]

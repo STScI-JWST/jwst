@@ -185,6 +185,7 @@ _calculated_suffixes = set([
     'assignmtwcsstep',
     'assign_mtwcs',
     'wavecorrstep',
+    'wfsscontamstep',
 ])
 
 

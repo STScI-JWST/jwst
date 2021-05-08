@@ -193,6 +193,10 @@ class Spec2Pipeline(Pipeline):
                 try:
                     science.meta.source_catalog = os.path.basename(members_by_type['sourcecat'][0])
                     self.log.info('Using sourcecat file {}'.format(science.meta.source_catalog))
+                    science.meta.segmentation_map = os.path.basename(members_by_type['segmap'][0])
+                    self.log.info('Using segmentation map {}'.format(science.meta.segmentation_map))
+                    science.meta.direct_image = os.path.basename(members_by_type['direct_image'][0])
+                    self.log.info('Using direct image {}'.format(science.meta.direct_image))
                 except IndexError:
                     if science.meta.source_catalog is None:
                         raise IndexError("No source catalog specified in association or datamodel")

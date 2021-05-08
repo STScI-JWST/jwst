@@ -2309,6 +2309,10 @@ properties:
         title: Segmentation map filename
         type: string
         fits_keyword: SEGMFILE
+      direct_image:
+        title: WFSS direct image filename
+        type: string
+        fits_keyword: DIRIMAGE
       resample:
         title: Resample Parameters
         type: object

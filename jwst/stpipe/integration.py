@@ -87,5 +87,6 @@ def get_steps():
         ("jwst.step.TweakRegStep", None, False),
         ("jwst.step.WavecorrStep", None, False),
         ("jwst.step.WfsCombineStep", 'calwebb_wfs-image3', False),
+        ("jwst.step.WfssContamStep", None, False),
         ("jwst.step.WhiteLightStep", None, False),
     ]

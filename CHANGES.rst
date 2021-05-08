@@ -206,6 +206,12 @@ tweakreg
 
 - Updated documentation to include the new "rshift" option for fit geometry [#5899]
 
+wfss_contam
+-----------
+
+- Implemented basic step structure to apply WFSS contamination corrections, along with
+  the necessary grism library modules [#5508]
+
 1.1.0 (2021-02-26)
 ==================
 

@@ -117,6 +117,8 @@ class SourceCatalogStep(Step):
 
                 segm_model = datamodels.ImageModel(segment_img.data)
                 segm_model.update(model, only="PRIMARY")
+                segm_model.meta.wcs = model.meta.wcs
+                segm_model.meta.wcsinfo = model.meta.wcsinfo
                 self.save_model(segm_model, suffix='segm')
                 model.meta.segmentation_map = segm_model.meta.filename
                 self.log.info(f'Wrote segmentation map: {segm_model.meta.filename}')
